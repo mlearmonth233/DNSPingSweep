@@ -34,7 +34,7 @@ Option Explicit
 Private Const PING_COUNT As Long = 4             ' echo requests per host (like Windows ping)
 Private Const PING_TIMEOUT_MS As Long = 1000     ' per echo request
 Private Const APP_NAME As String = "NetTools"
-Private Const APP_VERSION As String = "2.2.0"
+Private Const APP_VERSION As String = "2.2.1"
 
 ' ---- Result column headers ---------------------------------------------------
 Private Const H_HOST As String = "Host / IP"
@@ -109,7 +109,8 @@ Private Const TRACE_PROBES As Long = 3
 Private Const TRACE_TIMEOUT_MS As Long = 1000
 Private Const TRACE_GIVE_UP_AFTER As Long = 5    ' stop after this many silent hops in a row
 Private Const TRACE_MAX_HOSTS As Long = 20
-Private Const SCAN_TIMEOUT_MS As Long = 500      ' one ping per address when scanning
+Private Const SCAN_TIMEOUT_MS As Long = 500      ' per ping when scanning
+Private Const SCAN_PINGS As Long = 2             ' a 2nd ping only if the 1st gets no reply
 Private Const SCAN_MAX_ADDRESSES As Long = 4096  ' biggest scan allowed (a /20)
 Private Const SCAN_CONFIRM_ABOVE As Long = 256   ' ask before scanning more than this
 Private Const DNS_TYPE_PTR As Integer = 12
@@ -1137,9 +1138,9 @@ Private Sub RunSubnetScan()
     End If
     If totalAddr > SCAN_CONFIRM_ABOVE Then
         If MsgBox("Scan " & Format$(totalAddr, "#,##0") & " addresses?" & vbCrLf & vbCrLf & _
-                  "Addresses that answer take a moment each; ones that don't wait " & _
-                  SCAN_TIMEOUT_MS & " ms. Worst case about " & _
-                  Format$(totalAddr * (SCAN_TIMEOUT_MS / 1000#) / 60#, "0") & " minute(s). Esc stops it.", _
+                  "Addresses that answer take a moment each; ones that don't get " & SCAN_PINGS & _
+                  " pings of " & SCAN_TIMEOUT_MS & " ms. Worst case about " & _
+                  Format$(totalAddr * SCAN_PINGS * (SCAN_TIMEOUT_MS / 1000#) / 60#, "0") & " minute(s). Esc stops it.", _
                   vbOKCancel + vbQuestion, APP_NAME) <> vbOK Then Exit Sub
     End If
 
@@ -1182,7 +1183,7 @@ Private Function ScanOne(ByVal subnetText As String, ByVal hIcmp As LongPtr) As 
     Dim fromAddr As String, status As Long, rtt As Long, replyTtl As Long, answered As Boolean
     Dim ptr As String, fwd As Collection, v() As Variant, rowRng As Range
     Dim nUp As Long, nPtr As Long, nMismatch As Long, done As Long
-    Dim result As String, errNum As Long, errDesc As String
+    Dim result As String, errNum As Long, errDesc As String, attempt As Long
 
     info = ParseSubnet(subnetText)
     cidr = IPv4ToString(info.Network) & "/" & info.Prefix
@@ -1192,7 +1193,8 @@ Private Function ScanOne(ByVal subnetText As String, ByVal hIcmp As LongPtr) As 
     Set ws = NewResultSheet("Scan " & cidr)
     Set lo = StartResultTable(ws, "Subnet scan of " & cidr & "  (" & IPv4ToString(info.FirstHost) & _
                               " - " & IPv4ToString(info.LastHost) & ", " & Format$(n, "#,##0") & _
-                              " addresses, 1 ping each, " & SCAN_TIMEOUT_MS & " ms timeout)", headers, n)
+                              " addresses, 1 ping each + 1 retry if no reply, " & SCAN_TIMEOUT_MS & _
+                              " ms timeout)", headers, n)
     On Error GoTo Stopped
 
     For i = 1 To n
@@ -1205,7 +1207,12 @@ Private Function ScanOne(ByVal subnetText As String, ByVal hIcmp As LongPtr) As 
 
         ReDim v(0 To 5)
         v(0) = ip
-        answered = SendProbe(hIcmp, IPv4ToNetLong(ip), 128, SCAN_TIMEOUT_MS, fromAddr, status, rtt, replyTtl)
+        ' One ping; if it isn't answered, try again (the first is often lost
+        ' while the router resolves ARP for the address)
+        For attempt = 1 To SCAN_PINGS
+            answered = SendProbe(hIcmp, IPv4ToNetLong(ip), 128, SCAN_TIMEOUT_MS, fromAddr, status, rtt, replyTtl)
+            If answered And status = IP_SUCCESS Then Exit For
+        Next attempt
         If answered And status = IP_SUCCESS Then
             nUp = nUp + 1
             v(1) = "Up"

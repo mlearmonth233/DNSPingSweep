@@ -66,8 +66,8 @@ firewall blocking ICMP). IPv4 only. Up to 20 hosts per run.
 ### Subnet Scan results
 
 Type or select a subnet as `10.1.4.0/24` or `10.1.4.0 255.255.255.0` (any
-address inside it works too). NetTools pings every usable address once
-(500 ms timeout) and looks up its PTR record straight from DNS. Each
+address inside it works too). NetTools pings every usable address (500 ms timeout), pings it once more
+if the first gets no reply, and looks up its PTR record straight from DNS. Each
 subnet gets its own sheet, e.g. `Scan 10.1.4.0_24`, with a table of:
 
 | Column | Example |
@@ -83,7 +83,7 @@ A summary line above the table, and a pop-up at the end, give the count of
 addresses that are up and that have PTR records. Use the table's filter
 arrows to show only `Up` addresses or only ones with a PTR. Up to 4,096
 addresses (a /20) per subnet. NetTools asks before anything bigger than a
-/24. A /24 where nothing answers takes about 2 minutes. Esc stops the scan
+/24. A /24 where nothing answers takes about 4 minutes. Esc stops the scan
 and keeps what's been scanned so far.
 
 ### Subnet Calc results
@@ -124,7 +124,7 @@ Also available in formulas, if you want results next to your own data:
 
 ### MSI (recommended)
 
-Double-click `NetTools-2.2.0.msi` and close Excel first if it's open. No admin
+Double-click `NetTools-2.2.1.msi` and close Excel first if it's open. No admin
 rights are needed. The installer puts `NetTools.xlam` in your Excel startup
 folder (`%APPDATA%\Microsoft\Excel\XLSTART`). Excel loads it every time it
 starts, and because that folder is one of Office's default trusted
@@ -132,7 +132,7 @@ locations, the macros run without a security prompt.
 
 - Uninstall: **Settings > Apps > NetTools for Excel**.
 - Upgrade: run a newer MSI. It replaces the old version.
-- Silent / Intune / SCCM: `msiexec /i NetTools-2.2.0.msi /qn`. This is a
+- Silent / Intune / SCCM: `msiexec /i NetTools-2.2.1.msi /qn`. This is a
   **per-user** MSI, so deploy it in the *user* context.
 
 If your company uses Group Policy to turn off trusted locations or block
