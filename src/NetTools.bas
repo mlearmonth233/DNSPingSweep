@@ -7,7 +7,10 @@ Attribute VB_Name = "NetTools"
 ' DNS Only  : the lookups without the ping.
 ' Ping Only : status, latency and TTL.
 ' Traceroute: hop-by-hop path to a host (3 probes per hop, like tracert).
-' Subnet Scan: ping + reverse DNS (+ forward check) every address in a subnet.
+' Subnet Scan: ping, MAC + vendor, reverse DNS (+ forward check) and optional
+'             TCP ports for every address in a subnet - hundreds at once.
+' Port Check: is TCP 22/443/3389/... open on each host?
+' MAC Format: xxxx.xxxx.xxxx or XX:XX:XX:XX:XX:XX, plus the vendor.
 '
 ' Results always go on a NEW sheet as an Excel table - the data you select
 ' is never changed.
@@ -34,7 +37,7 @@ Option Explicit
 Private Const PING_COUNT As Long = 4             ' echo requests per host (like Windows ping)
 Private Const PING_TIMEOUT_MS As Long = 1000     ' per echo request
 Private Const APP_NAME As String = "NetTools"
-Private Const APP_VERSION As String = "2.2.1"
+Private Const APP_VERSION As String = "3.0.0"
 
 ' ---- Result column headers ---------------------------------------------------
 Private Const H_HOST As String = "Host / IP"
@@ -63,6 +66,9 @@ Private Const S_TOTAL As String = "Total Addresses"
 ' ---- Subnet scan column headers ------------------------------------------------
 Private Const SC_IP As String = "IP Address"
 Private Const SC_LAT As String = "Latency (ms)"
+Private Const SC_MAC As String = "MAC Address"
+Private Const SC_VENDOR As String = "Vendor"
+Private Const SC_OPEN As String = "Open Ports"
 Private Const RESULT_TABLE_STYLE As String = "TableStyleMedium2"
 Private Const RESULT_HEADER_ROW As Long = 4
 
@@ -109,8 +115,15 @@ Private Const TRACE_PROBES As Long = 3
 Private Const TRACE_TIMEOUT_MS As Long = 1000
 Private Const TRACE_GIVE_UP_AFTER As Long = 5    ' stop after this many silent hops in a row
 Private Const TRACE_MAX_HOSTS As Long = 20
-Private Const SCAN_TIMEOUT_MS As Long = 500      ' per ping when scanning
-Private Const SCAN_PINGS As Long = 2             ' a 2nd ping only if the 1st gets no reply
+Private Const SCAN_TIMEOUT_MS As Long = 1000     ' per ping when scanning (a 2nd ping goes to non-repliers)
+Private Const SCAN_PARALLEL As Long = 256        ' pings in flight at once
+Private Const ICMP_REPLY_BUF As Long = 512       ' reply buffer per ping
+Private Const PORT_TIMEOUT_MS As Long = 2500     ' TCP connect timeout
+Private Const PORT_PARALLEL As Long = 200        ' TCP connects in flight at once
+Private Const MAX_PORTS As Long = 64
+Private Const DEFAULT_PORTS As String = "22,80,443,3389"
+Private Const MAC_CISCO As Long = 1              ' aabb.ccdd.eeff
+Private Const MAC_COLON As Long = 2              ' AA:BB:CC:DD:EE:FF
 Private Const SCAN_MAX_ADDRESSES As Long = 4096  ' biggest scan allowed (a /20)
 Private Const SCAN_CONFIRM_ABOVE As Long = 256   ' ask before scanning more than this
 Private Const DNS_TYPE_PTR As Integer = 12
@@ -133,7 +146,53 @@ Private Declare PtrSafe Function DnsQuery_A Lib "dnsapi.dll" ( _
 Private Declare PtrSafe Sub DnsRecordListFree Lib "dnsapi.dll" (ByVal pRecordList As LongPtr, ByVal FreeType As Long)
 Private Declare PtrSafe Function lstrlenA Lib "kernel32" (ByVal lpString As LongPtr) As Long
 
+' ---- Parallel ping (IcmpSendEcho2 + events) -----------------------------------
+Private Declare PtrSafe Function IcmpSendEcho2 Lib "iphlpapi.dll" ( _
+    ByVal IcmpHandle As LongPtr, ByVal hEvent As LongPtr, ByVal ApcRoutine As LongPtr, _
+    ByVal ApcContext As LongPtr, ByVal DestinationAddress As Long, ByVal RequestData As LongPtr, _
+    ByVal RequestSize As Integer, ByVal RequestOptions As LongPtr, ByVal ReplyBuffer As LongPtr, _
+    ByVal ReplySize As Long, ByVal Timeout As Long) As Long
+Private Declare PtrSafe Function IcmpParseReplies Lib "iphlpapi.dll" ( _
+    ByVal ReplyBuffer As LongPtr, ByVal ReplySize As Long) As Long
+Private Declare PtrSafe Function CreateEventA Lib "kernel32" (ByVal lpEventAttributes As LongPtr, _
+    ByVal bManualReset As Long, ByVal bInitialState As Long, ByVal lpName As LongPtr) As LongPtr
+Private Declare PtrSafe Function SetEvent Lib "kernel32" (ByVal hEvent As LongPtr) As Long
+Private Declare PtrSafe Function ResetEvent Lib "kernel32" (ByVal hEvent As LongPtr) As Long
+Private Declare PtrSafe Function CloseHandle Lib "kernel32" (ByVal hObject As LongPtr) As Long
+Private Declare PtrSafe Function WaitForMultipleObjects Lib "kernel32" (ByVal nCount As Long, _
+    ByVal lpHandles As LongPtr, ByVal bWaitAll As Long, ByVal dwMilliseconds As Long) As Long
+Private Declare PtrSafe Sub RtlZeroMemory Lib "kernel32" (ByVal Destination As LongPtr, ByVal Length As LongPtr)
+
+' ---- ARP table (MAC addresses of devices on directly connected subnets) -------
+Private Declare PtrSafe Function GetIpNetTable Lib "iphlpapi.dll" (ByVal pIpNetTable As LongPtr, _
+    ByRef pdwSize As Long, ByVal bOrder As Long) As Long
+
+' ---- TCP port check (non-blocking connect + select) ---------------------------
+Private Const FIONBIO As Long = &H8004667E
+Private Const SOL_SOCKET As Long = &HFFFF&
+Private Const SO_ERROR As Long = &H1007
+Private Const IPPROTO_TCP As Long = 6
+Private Const WSAEWOULDBLOCK As Long = 10035
+Private Const WSAECONNREFUSED As Long = 10061
+Private Const WSAENETUNREACH As Long = 10051
+Private Const WSAEHOSTUNREACH As Long = 10065
+Private Declare PtrSafe Function ws_socket Lib "ws2_32.dll" Alias "socket" ( _
+    ByVal af As Long, ByVal stype As Long, ByVal protocol As Long) As LongPtr
+Private Declare PtrSafe Function closesocket Lib "ws2_32.dll" (ByVal s As LongPtr) As Long
+Private Declare PtrSafe Function ioctlsocket Lib "ws2_32.dll" (ByVal s As LongPtr, _
+    ByVal cmd As Long, ByRef argp As Long) As Long
+Private Declare PtrSafe Function ws_connect Lib "ws2_32.dll" Alias "connect" (ByVal s As LongPtr, _
+    ByVal name As LongPtr, ByVal namelen As Long) As Long
+Private Declare PtrSafe Function ws_select Lib "ws2_32.dll" Alias "select" (ByVal nfds As Long, _
+    ByVal readfds As LongPtr, ByVal writefds As LongPtr, ByVal exceptfds As LongPtr, _
+    ByVal timeout As LongPtr) As Long
+Private Declare PtrSafe Function getsockopt Lib "ws2_32.dll" (ByVal s As LongPtr, ByVal level As Long, _
+    ByVal optname As Long, ByRef optval As Long, ByRef optlen As Long) As Long
+Private Declare PtrSafe Function WSAGetLastError Lib "ws2_32.dll" () As Long
+
 Private mWmi As Object
+Private mOui As Object          ' MAC vendor list (OUI -> vendor), loaded on first use
+Private mOuiTried As Boolean
 
 ' Result of parsing/calculating one IPv4 subnet (addresses as 0..2^32-1)
 Private Type SubnetInfo
@@ -180,6 +239,14 @@ Public Sub NT_OnPingOnly(control As IRibbonControl)
     RunChecks False, True
 End Sub
 
+Public Sub NT_OnPortCheck(control As IRibbonControl)
+    RunPortCheck
+End Sub
+
+Public Sub NT_OnMacFormat(control As IRibbonControl)
+    RunMacFormat
+End Sub
+
 Public Sub NT_OnTraceroute(control As IRibbonControl)
     RunTraceroute
 End Sub
@@ -197,15 +264,17 @@ Public Sub NT_OnAbout(control As IRibbonControl)
         "1. Select a column of IP addresses, hostnames or subnets" & vbCrLf & _
         "   (select just the first cell to run to the end of the list)," & vbCrLf & _
         "   or select an empty cell to type them in." & vbCrLf & _
-        "2. Click Check DNS, DNS Only, Ping Only, Traceroute, Subnet Scan" & vbCrLf & _
-        "   or Subnet Calc." & vbCrLf & _
+        "2. Click a button: Check DNS, DNS Only, Ping Only, Port Check," & vbCrLf & _
+        "   Traceroute, Subnet Scan, Subnet Calc or MAC Format." & vbCrLf & _
         "3. Results go on their own sheet as a table (rerunning overwrites" & vbCrLf & _
         "   that sheet) - the data you selected is never changed." & vbCrLf & _
         "   Press Esc to stop a long run." & vbCrLf & vbCrLf & _
         "A header row (e.g. 'Hostname' or 'IP Address') is detected and skipped." & vbCrLf & _
         "Each traceroute and each subnet scan gets its own sheet." & vbCrLf & vbCrLf & _
         "Worksheet functions: =NT_RESOLVE(A2)  =NT_PTR(A2)  =NT_PING(A2)" & vbCrLf & _
-        "   =NT_SUBNET(A2, ""network"")  =NT_INSUBNET(B2, A2)" & vbCrLf & vbCrLf & _
+        "   =NT_SUBNET(A2, ""network"")  =NT_INSUBNET(B2, A2)" & vbCrLf & _
+        "   =NT_MAC(A2, ""cisco"")  =NT_VENDOR(A2)" & vbCrLf & vbCrLf & _
+        "MAC vendor list: " & IIf(OuiList().Count > 0, Format$(OuiList().Count, "#,##0") & " vendors", "not installed") & vbCrLf & _
         "Ping: " & PING_COUNT & " echo requests per host, " & PING_TIMEOUT_MS & " ms timeout each.", _
         vbInformation, "About " & APP_NAME
 End Sub
@@ -221,6 +290,14 @@ End Sub
 
 Public Sub NetTools_PingOnly()
     RunChecks False, True
+End Sub
+
+Public Sub NetTools_PortCheck()
+    RunPortCheck
+End Sub
+
+Public Sub NetTools_MacFormat()
+    RunMacFormat
 End Sub
 
 Public Sub NetTools_Traceroute()
@@ -424,7 +501,8 @@ Private Function LooksLikeHeader(ByVal s As String) As Boolean
              "ip_address", "ip-address", "address", "addresses", "name", "names", "device", _
              "devices", "fqdn", "server", "servers", "target", "targets", "node", "nodes", _
              "dns", "dnsname", "dns_name", "subnet", "subnets", "cidr", "network", "networks", _
-             "prefix", "prefixes", "range", "ranges", "vlan", "vlans"
+             "prefix", "prefixes", "range", "ranges", "vlan", "vlans", "mac", "macs", _
+             "mac_address", "macaddress", "hwaddr", "bia"
             LooksLikeHeader = True
     End Select
 End Function
@@ -1111,7 +1189,8 @@ End Function
 Private Sub RunSubnetScan()
     Dim items As Collection, srcDesc As String, item As Variant
     Dim subnets As New Collection, info As SubnetInfo, totalAddr As Double, bad As String
-    Dim hIcmp As LongPtr, wsaOk As Boolean, i As Long, summary As String
+    Dim wsaOk As Boolean, i As Long, summary As String, ports() As Long, nPorts As Long
+    Dim secs As Double
 
     Set items = GetInputList("Subnet to scan, for example:" & vbCrLf & vbCrLf & _
                              "   10.1.4.0/24" & vbCrLf & _
@@ -1136,25 +1215,25 @@ Private Sub RunSubnetScan()
         MsgBox "These can't be scanned:" & bad, vbExclamation, APP_NAME
         Exit Sub
     End If
+
+    ' Optional TCP ports
+    If Not AskPorts("TCP ports to check on every address (leave blank for none)." & vbCrLf & vbCrLf & _
+                    "Example: 22,80,443,3389 or 8000-8010", True, ports, nPorts) Then Exit Sub
+
     If totalAddr > SCAN_CONFIRM_ABOVE Then
-        If MsgBox("Scan " & Format$(totalAddr, "#,##0") & " addresses?" & vbCrLf & vbCrLf & _
-                  "Addresses that answer take a moment each; ones that don't get " & SCAN_PINGS & _
-                  " pings of " & SCAN_TIMEOUT_MS & " ms. Worst case about " & _
-                  Format$(totalAddr * SCAN_PINGS * (SCAN_TIMEOUT_MS / 1000#) / 60#, "0") & " minute(s). Esc stops it.", _
+        secs = (Int((totalAddr - 1) / SCAN_PARALLEL) + 1) * 2 * (SCAN_TIMEOUT_MS / 1000#) + totalAddr * 0.02
+        If nPorts > 0 Then secs = secs + (Int((totalAddr * nPorts - 1) / PORT_PARALLEL) + 1) * (PORT_TIMEOUT_MS / 1000#)
+        If MsgBox("Scan " & Format$(totalAddr, "#,##0") & " addresses" & _
+                  IIf(nPorts > 0, " and " & nPorts & " port(s) on each", "") & "?" & vbCrLf & vbCrLf & _
+                  "This takes roughly " & Format$(secs / 60#, "0.0") & " minute(s). Esc stops it.", _
                   vbOKCancel + vbQuestion, APP_NAME) <> vbOK Then Exit Sub
     End If
 
     Application.EnableCancelKey = xlErrorHandler
     On Error GoTo Handler
     wsaOk = WsaInit()
-    hIcmp = IcmpCreateFile()
-    If hIcmp = 0 Or hIcmp = -1 Then
-        MsgBox "Could not open the Windows ICMP service (IcmpCreateFile failed).", vbCritical, APP_NAME
-        GoTo Cleanup
-    End If
-
     For i = 1 To subnets.Count
-        summary = summary & ScanOne(subnets(i), hIcmp) & vbCrLf
+        summary = summary & ScanOne(subnets(i), ports, nPorts) & vbCrLf & vbCrLf
     Next i
     Application.StatusBar = False
     MsgBox summary, vbInformation, APP_NAME
@@ -1162,117 +1241,790 @@ Private Sub RunSubnetScan()
 
 Handler:
     Application.StatusBar = False
+    Application.ScreenUpdating = True
     If Err.Number = 18 Then
-        MsgBox "Scan stopped. The addresses scanned so far are on the sheet.", vbInformation, APP_NAME
+        MsgBox "Scan stopped.", vbInformation, APP_NAME
     Else
         MsgBox "Error " & Err.Number & ": " & Err.Description, vbCritical, APP_NAME
     End If
 
 Cleanup:
     On Error Resume Next
-    If hIcmp <> 0 And hIcmp <> -1 Then IcmpCloseHandle hIcmp
     If wsaOk Then WSACleanup
     Application.StatusBar = False
     Application.EnableCancelKey = xlInterrupt
 End Sub
 
-' Scans one subnet onto its own sheet ("Scan 10.1.4.0_24"). Returns a one-line summary.
-Private Function ScanOne(ByVal subnetText As String, ByVal hIcmp As LongPtr) As String
-    Dim info As SubnetInfo, cidr As String, ws As Worksheet, lo As ListObject
-    Dim headers As Variant, n As Long, i As Long, a As Double, ip As String
-    Dim fromAddr As String, status As Long, rtt As Long, replyTtl As Long, answered As Boolean
-    Dim ptr As String, fwd As Collection, v() As Variant, rowRng As Range
-    Dim nUp As Long, nPtr As Long, nMismatch As Long, done As Long
-    Dim result As String, errNum As Long, errDesc As String, attempt As Long
+' Scans one subnet onto its own sheet ("Scan 10.1.4.0_24"). Returns a short summary.
+Private Function ScanOne(ByVal subnetText As String, ports() As Long, ByVal nPorts As Long) As String
+    Dim info As SubnetInfo, cidr As String, n As Long, i As Long, j As Long, c As Long
+    Dim ips() As String, todo() As Boolean, up() As Boolean, st() As Long, rtt() As Long, ttl() As Long
+    Dim arp As Object, portRes As Variant, headers() As Variant, nCols As Long, out() As Variant
+    Dim ptr As String, fwd As Collection, mac As String, openList As String, macStyle As Long
+    Dim ws As Worksheet, lo As ListObject, rowRng As Range, result As String
+    Dim nUp As Long, nMac As Long, nPtr As Long, nOpen As Long, nMismatch As Long, nFound As Long
+    Dim present As Boolean
 
     info = ParseSubnet(subnetText)
     cidr = IPv4ToString(info.Network) & "/" & info.Prefix
     n = CLng(info.Hosts)
-    headers = Array(SC_IP, H_PING, SC_LAT, H_TTL, H_PTR, H_MATCH)
+    ReDim ips(1 To n), todo(1 To n), up(1 To n), st(1 To n), rtt(1 To n), ttl(1 To n)
+    For i = 1 To n
+        ips(i) = IPv4ToString(info.FirstHost + i - 1)
+        todo(i) = True
+    Next i
 
-    Set ws = NewResultSheet("Scan " & cidr)
-    Set lo = StartResultTable(ws, "Subnet scan of " & cidr & "  (" & IPv4ToString(info.FirstHost) & _
-                              " - " & IPv4ToString(info.LastHost) & ", " & Format$(n, "#,##0") & _
-                              " addresses, 1 ping each + 1 retry if no reply, " & SCAN_TIMEOUT_MS & _
-                              " ms timeout)", headers, n)
-    On Error GoTo Stopped
+    ' 1. Ping everything, then once more for anything that didn't answer
+    PingMany ips, todo, SCAN_TIMEOUT_MS, up, st, rtt, ttl, "scanning " & cidr & " - ping"
+    For i = 1 To n
+        todo(i) = Not up(i)
+    Next i
+    PingMany ips, todo, SCAN_TIMEOUT_MS, up, st, rtt, ttl, "scanning " & cidr & " - 2nd ping"
+
+    ' 2. MAC addresses: the pings fill the PC's ARP table for local subnets
+    Set arp = ArpTable()
+    macStyle = CLng(GetSetting(APP_NAME, "Mac", "Style", CStr(MAC_COLON)))
+
+    ' 3. TCP ports
+    If nPorts > 0 Then
+        For i = 1 To n
+            todo(i) = True
+        Next i
+        portRes = TcpScan(ips, todo, ports, nPorts, "scanning " & cidr & " - ports")
+    End If
+
+    ' 4. Reverse DNS, and build the table
+    ReDim headers(0 To 7 + nPorts + IIf(nPorts > 0, 1, 0))
+    headers(0) = SC_IP: headers(1) = H_PING: headers(2) = SC_LAT: headers(3) = H_TTL
+    headers(4) = SC_MAC: headers(5) = SC_VENDOR: headers(6) = H_PTR: headers(7) = H_MATCH
+    For j = 0 To nPorts - 1
+        headers(8 + j) = PortLabel(ports(j))
+    Next j
+    If nPorts > 0 Then headers(8 + nPorts) = SC_OPEN
+    nCols = UBound(headers) + 1
+    ReDim out(1 To n, 1 To nCols)
 
     For i = 1 To n
-        a = info.FirstHost + i - 1
-        ip = IPv4ToString(a)
-        If i Mod 4 = 1 Then
-            Application.StatusBar = APP_NAME & ": scanning " & cidr & " - " & ip & "  (" & i & " of " & n & _
-                                    ", " & nUp & " up)   -   press Esc to stop"
+        If i Mod 8 = 1 Then
+            Application.StatusBar = APP_NAME & ": scanning " & cidr & " - DNS " & i & " of " & n & _
+                                    "   -   press Esc to stop"
+            DoEvents
         End If
-
-        ReDim v(0 To 5)
-        v(0) = ip
-        ' One ping; if it isn't answered, try again (the first is often lost
-        ' while the router resolves ARP for the address)
-        For attempt = 1 To SCAN_PINGS
-            answered = SendProbe(hIcmp, IPv4ToNetLong(ip), 128, SCAN_TIMEOUT_MS, fromAddr, status, rtt, replyTtl)
-            If answered And status = IP_SUCCESS Then Exit For
-        Next attempt
-        If answered And status = IP_SUCCESS Then
-            nUp = nUp + 1
-            v(1) = "Up"
-            If rtt < 1 Then v(2) = "<1" Else v(2) = rtt
-            v(3) = replyTtl
-        ElseIf answered Then
-            v(1) = PingStatusText(status)
+        present = False
+        out(i, 1) = ips(i)
+        If up(i) Then
+            nUp = nUp + 1: present = True
+            out(i, 2) = "Up"
+            If rtt(i) < 1 Then out(i, 3) = "<1" Else out(i, 3) = rtt(i)
+            out(i, 4) = ttl(i)
+        ElseIf st(i) = 0 Or st(i) = IP_REQ_TIMED_OUT Then
+            out(i, 2) = "No reply"
         Else
-            v(1) = "No reply"
+            out(i, 2) = PingStatusText(st(i))
         End If
 
-        ptr = PtrLookupDns(ip)
+        If arp.Exists(ips(i)) Then
+            mac = arp(ips(i))
+            nMac = nMac + 1: present = True
+            out(i, 5) = FormatMac(mac, macStyle)
+            out(i, 6) = MacVendor(mac)
+        End If
+
+        ptr = PtrLookupDns(ips(i))
         If Len(ptr) > 0 Then
             nPtr = nPtr + 1
-            v(4) = ptr
+            out(i, 7) = ptr
             Set fwd = LookupAddresses(ptr)
-            If InCollection(fwd, ip) Then
-                v(5) = "Yes"
+            If InCollection(fwd, ips(i)) Then
+                out(i, 8) = "Yes"
             ElseIf fwd.Count = 0 Then
-                v(5) = "No - PTR name does not resolve"
+                out(i, 8) = "No - PTR name does not resolve"
                 nMismatch = nMismatch + 1
             Else
-                v(5) = "No - PTR name resolves to " & JoinCollection(fwd)
+                out(i, 8) = "No - PTR name resolves to " & JoinCollection(fwd)
                 nMismatch = nMismatch + 1
             End If
-        Else
-            v(4) = ""
-            v(5) = ""
         End If
 
+        If nPorts > 0 Then
+            openList = ""
+            For j = 0 To nPorts - 1
+                out(i, 9 + j) = portRes(i, j)
+                If portRes(i, j) = "Open" Then
+                    If Len(openList) > 0 Then openList = openList & ", "
+                    openList = openList & ports(j)
+                End If
+            Next j
+            out(i, 9 + nPorts) = openList
+            If Len(openList) > 0 Then nOpen = nOpen + 1: present = True
+        End If
+        If present Then nFound = nFound + 1
+    Next i
+
+    ' 5. Write it all in one go, then colour it
+    Application.StatusBar = APP_NAME & ": writing results for " & cidr
+    Set ws = NewResultSheet("Scan " & cidr)
+    Set lo = StartResultTable(ws, "Subnet scan of " & cidr & "  (" & IPv4ToString(info.FirstHost) & _
+                              " - " & IPv4ToString(info.LastHost) & ", " & Format$(n, "#,##0") & " addresses" & _
+                              IIf(nPorts > 0, ", TCP " & JoinPorts(ports, nPorts), "") & ")", headers, n)
+    Application.ScreenUpdating = False
+    lo.DataBodyRange.Value = out
+    For i = 1 To n
         Set rowRng = lo.DataBodyRange.Rows(i)
-        rowRng.Value = v
-        If v(1) = "Up" Then
+        If up(i) Then
             Good rowRng.Cells(1, 1): Good rowRng.Cells(1, 2)
         Else
             rowRng.Cells(1, 2).Font.Color = RGB(128, 128, 128)
+            ' There (has a MAC or an open port) but not answering ping: yellow
+            If Len(CStr(out(i, 5))) > 0 Then
+                Warn rowRng.Cells(1, 1)
+            ElseIf nPorts > 0 Then
+                If Len(CStr(out(i, 9 + nPorts))) > 0 Then Warn rowRng.Cells(1, 1)
+            End If
         End If
-        If v(5) = "Yes" Then
-            Good rowRng.Cells(1, 6)
-        ElseIf Left$(CStr(v(5)), 2) = "No" Then
-            Warn rowRng.Cells(1, 6)
+        If out(i, 8) = "Yes" Then
+            Good rowRng.Cells(1, 8)
+        ElseIf Left$(CStr(out(i, 8)), 2) = "No" Then
+            Warn rowRng.Cells(1, 8)
         End If
-        done = i
-        DoEvents
+        For j = 0 To nPorts - 1
+            ColourPortCell rowRng.Cells(1, 9 + j)
+        Next j
     Next i
+    FinishTable lo, n
+    Application.ScreenUpdating = True
 
-    FinishTable lo, done
-    result = cidr & ":  " & nUp & " of " & n & " up,  " & nPtr & " with a PTR record" & _
-              IIf(nMismatch > 0, ",  " & nMismatch & " PTR mismatch(es)", "") & _
-              "   (sheet """ & ws.Name & """)"
+    result = cidr & ":  " & nFound & " device(s) found  (" & nUp & " answer ping, " & nMac & " with a MAC" & _
+             IIf(nPorts > 0, ", " & nOpen & " with open ports", "") & "),  " & nPtr & " with a PTR record" & _
+             IIf(nMismatch > 0, ",  " & nMismatch & " PTR mismatch(es)", "") & "   (sheet """ & ws.Name & """)"
     ws.Cells(3, 1).Value = result
     ScanOne = result
-    Exit Function
+End Function
 
-Stopped:
-    ' Esc (or an error): keep what's done, then let the caller report it
+' Pings many IPv4 addresses at once - up to SCAN_PARALLEL in flight - using
+' IcmpSendEcho2 with an event per ping. Only ips(i) with todo(i) = True are
+' pinged; up/st/rtt/ttl are filled in for those.
+Private Sub PingMany(ips() As String, todo() As Boolean, ByVal timeoutMs As Long, _
+        up() As Boolean, st() As Long, rtt() As Long, ttl() As Long, ByVal label As String)
+    Dim i As Long, k As Long, g As Long, cnt As Long, used As Long, total As Long, done As Long
+    Dim idx() As Long, hIcmp() As LongPtr, ev() As LongPtr, buf() As Byte
+    Dim opt(0 To 15) As Byte, payload(0 To 31) As Byte, pBuf As LongPtr
+    Dim ret As Long, lastErr As Long, nReplies As Long, status As Long, t0 As Double, waitMs As Long
+    Dim errNum As Long, errDesc As String
+
+    For i = LBound(ips) To UBound(ips)
+        If todo(i) Then total = total + 1
+    Next i
+    If total = 0 Then Exit Sub
+
+    ReDim idx(0 To SCAN_PARALLEL - 1), hIcmp(0 To SCAN_PARALLEL - 1), ev(0 To SCAN_PARALLEL - 1)
+    ReDim buf(0 To ICMP_REPLY_BUF - 1, 0 To SCAN_PARALLEL - 1)   ' one column per ping, contiguous
+    opt(0) = 128                                                 ' TTL
+    For k = 0 To 31
+        payload(k) = 97 + (k Mod 23)
+    Next k
+    For k = 0 To SCAN_PARALLEL - 1
+        ev(k) = CreateEventA(0, 1, 0, 0)
+        hIcmp(k) = IcmpCreateFile()
+    Next k
+
+    On Error GoTo Done
+    i = LBound(ips)
+    Do While i <= UBound(ips)
+        Application.StatusBar = APP_NAME & ": " & label & " (" & done & " of " & total & ")   -   press Esc to stop"
+        DoEvents
+
+        ' Send a batch
+        used = 0
+        Do While i <= UBound(ips) And used < SCAN_PARALLEL
+            If todo(i) Then
+                idx(used) = i
+                pBuf = VarPtr(buf(0, used))
+                RtlZeroMemory pBuf, ICMP_REPLY_BUF
+                ResetEvent ev(used)
+                ret = IcmpSendEcho2(hIcmp(used), ev(used), 0, 0, IPv4ToNetLong(ips(i)), VarPtr(payload(0)), 32, _
+                                    VarPtr(opt(0)), pBuf, ICMP_REPLY_BUF, timeoutMs)
+                lastErr = Err.LastDllError
+                ' Anything other than "pending" won't signal the event, so do it here
+                If Not (ret = 0 And lastErr = 997) Then SetEvent ev(used)
+                used = used + 1
+            End If
+            i = i + 1
+        Loop
+        If used = 0 Then Exit Do
+
+        ' Wait for the batch (WaitForMultipleObjects takes 64 handles at a time)
+        t0 = Timer
+        For g = 0 To used - 1 Step 64
+            cnt = used - g
+            If cnt > 64 Then cnt = 64
+            waitMs = timeoutMs + 1000 - CLng((Timer - t0) * 1000)
+            If waitMs < 1 Then waitMs = 1
+            WaitForMultipleObjects cnt, VarPtr(ev(g)), 1, waitMs
+        Next g
+
+        ' Read the replies (ICMP_ECHO_REPLY: Address @0, Status @4, RTT @8, Options.Ttl @16+ptr)
+        For k = 0 To used - 1
+            pBuf = VarPtr(buf(0, k))
+            nReplies = IcmpParseReplies(pBuf, ICMP_REPLY_BUF)
+            status = ReadLong(pBuf + 4)
+            If nReplies > 0 And status = IP_SUCCESS Then
+                up(idx(k)) = True
+                st(idx(k)) = IP_SUCCESS
+                rtt(idx(k)) = ReadLong(pBuf + 8)
+                ttl(idx(k)) = buf(16 + PTR_SIZE, k)
+            ElseIf ReadLong(pBuf) <> 0 And status <> IP_SUCCESS And status <> IP_REQ_TIMED_OUT Then
+                st(idx(k)) = status          ' e.g. a router said "destination host unreachable"
+            Else
+                st(idx(k)) = IP_REQ_TIMED_OUT
+            End If
+        Next k
+        done = done + used
+    Loop
+
+Done:
     errNum = Err.Number: errDesc = Err.Description
-    FinishTable lo, done
-    ws.Cells(3, 1).Value = "Stopped after " & done & " of " & n & " addresses: " & nUp & " up, " & nPtr & " with a PTR record."
-    Err.Raise errNum, , errDesc
+    For k = 0 To SCAN_PARALLEL - 1
+        If hIcmp(k) <> 0 And hIcmp(k) <> -1 Then IcmpCloseHandle hIcmp(k)
+        If ev(k) <> 0 Then CloseHandle ev(k)
+    Next k
+    If errNum <> 0 Then Err.Raise errNum, , errDesc
+End Sub
+
+' Tries a TCP connection to every ips(i) (with todo(i) = True) on every port,
+' up to PORT_PARALLEL at once. Returns res(i, j) = "Open" / "Closed" /
+' "Filtered" / "Unreachable" for ips(i), ports(j); "" where not checked.
+Private Function TcpScan(ips() As String, todo() As Boolean, ports() As Long, ByVal nPorts As Long, _
+        ByVal label As String) As Variant
+    Dim res() As String, total As Long, done As Long, i As Long, j As Long, k As Long, m As Long
+    Dim used As Long, socks() As LongPtr, pIp() As Long, pPort() As Long, pending() As Boolean, nPending As Long
+    Dim sa(0 To 15) As Byte, ipb() As String, nb As Long, ret As Long, lastErr As Long
+    Dim wf() As Byte, ef() As Byte, tv(0 To 1) As Long, setBytes As Long, cnt As Long
+    Dim deadline As Double, remaining As Long, s As LongPtr, soErr As Long, optLen As Long
+    Dim errNum As Long, errDesc As String
+
+    ReDim res(LBound(ips) To UBound(ips), 0 To nPorts - 1)
+    For i = LBound(ips) To UBound(ips)
+        If todo(i) Then total = total + nPorts
+    Next i
+    If total = 0 Then TcpScan = res: Exit Function
+
+    ReDim socks(0 To PORT_PARALLEL - 1), pIp(0 To PORT_PARALLEL - 1), pPort(0 To PORT_PARALLEL - 1)
+    ReDim pending(0 To PORT_PARALLEL - 1)
+    setBytes = PTR_SIZE + PORT_PARALLEL * PTR_SIZE   ' fd_set: count, then the sockets
+    ReDim wf(0 To setBytes - 1), ef(0 To setBytes - 1)
+
+    On Error GoTo Done
+    i = LBound(ips): j = 0
+    Do
+        Application.StatusBar = APP_NAME & ": " & label & " (" & done & " of " & total & ")   -   press Esc to stop"
+        DoEvents
+
+        ' Start a batch of non-blocking connects
+        used = 0: nPending = 0
+        Do While i <= UBound(ips) And used < PORT_PARALLEL
+            If Not todo(i) Then
+                i = i + 1: j = 0
+            Else
+                pIp(used) = i: pPort(used) = j
+                s = ws_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+                socks(used) = s
+                pending(used) = False
+                If s = -1 Or s = 0 Then
+                    res(i, j) = "Error"
+                    socks(used) = 0
+                Else
+                    nb = 1
+                    ioctlsocket s, FIONBIO, nb
+                    Erase sa
+                    sa(0) = AF_INET
+                    sa(2) = ports(j) \ 256: sa(3) = ports(j) Mod 256
+                    ipb = Split(ips(i), ".")
+                    sa(4) = CByte(ipb(0)): sa(5) = CByte(ipb(1)): sa(6) = CByte(ipb(2)): sa(7) = CByte(ipb(3))
+                    ret = ws_connect(s, VarPtr(sa(0)), 16)
+                    If ret = 0 Then
+                        res(i, j) = "Open"
+                    Else
+                        lastErr = WSAGetLastError()
+                        If lastErr = WSAEWOULDBLOCK Then
+                            pending(used) = True: nPending = nPending + 1
+                        ElseIf lastErr = WSAECONNREFUSED Then
+                            res(i, j) = "Closed"
+                        Else
+                            res(i, j) = "Unreachable"
+                        End If
+                    End If
+                End If
+                used = used + 1
+                j = j + 1
+                If j >= nPorts Then j = 0: i = i + 1
+            End If
+        Loop
+        If used = 0 Then Exit Do
+
+        ' Wait for them: writable = connected, exception = failed
+        deadline = Timer + PORT_TIMEOUT_MS / 1000#
+        Do While nPending > 0
+            remaining = CLng((deadline - Timer) * 1000)
+            If remaining <= 0 Then Exit Do
+            cnt = 0
+            For k = 0 To used - 1
+                If pending(k) Then
+                    CopyMemory wf(PTR_SIZE + cnt * PTR_SIZE), VarPtr(socks(k)), PTR_SIZE
+                    CopyMemory ef(PTR_SIZE + cnt * PTR_SIZE), VarPtr(socks(k)), PTR_SIZE
+                    cnt = cnt + 1
+                End If
+            Next k
+            CopyMemory wf(0), VarPtr(cnt), 4
+            CopyMemory ef(0), VarPtr(cnt), 4
+            tv(0) = remaining \ 1000
+            tv(1) = (remaining Mod 1000) * 1000
+            ret = ws_select(0, 0, VarPtr(wf(0)), VarPtr(ef(0)), VarPtr(tv(0)))
+            If ret <= 0 Then Exit Do
+
+            cnt = ReadLong(VarPtr(wf(0)))
+            For m = 0 To cnt - 1
+                s = ReadPtr(VarPtr(wf(PTR_SIZE + m * PTR_SIZE)))
+                For k = 0 To used - 1
+                    If pending(k) And socks(k) = s Then
+                        res(pIp(k), pPort(k)) = "Open"
+                        pending(k) = False: nPending = nPending - 1
+                        Exit For
+                    End If
+                Next k
+            Next m
+            cnt = ReadLong(VarPtr(ef(0)))
+            For m = 0 To cnt - 1
+                s = ReadPtr(VarPtr(ef(PTR_SIZE + m * PTR_SIZE)))
+                For k = 0 To used - 1
+                    If pending(k) And socks(k) = s Then
+                        soErr = 0: optLen = 4
+                        getsockopt s, SOL_SOCKET, SO_ERROR, soErr, optLen
+                        If soErr = WSAECONNREFUSED Then
+                            res(pIp(k), pPort(k)) = "Closed"
+                        ElseIf soErr = WSAEHOSTUNREACH Or soErr = WSAENETUNREACH Then
+                            res(pIp(k), pPort(k)) = "Unreachable"
+                        Else
+                            res(pIp(k), pPort(k)) = "Filtered"
+                        End If
+                        pending(k) = False: nPending = nPending - 1
+                        Exit For
+                    End If
+                Next k
+            Next m
+            DoEvents
+        Loop
+
+        ' No answer in time = filtered (a firewall dropped it, or nothing there)
+        For k = 0 To used - 1
+            If pending(k) Then res(pIp(k), pPort(k)) = "Filtered"
+            If socks(k) <> 0 Then closesocket socks(k): socks(k) = 0
+        Next k
+        done = done + used
+    Loop
+
+Done:
+    errNum = Err.Number: errDesc = Err.Description
+    For k = 0 To PORT_PARALLEL - 1
+        If socks(k) <> 0 Then closesocket socks(k)
+    Next k
+    If errNum <> 0 Then Err.Raise errNum, , errDesc
+    TcpScan = res
+End Function
+
+Private Sub ColourPortCell(ByVal c As Range)
+    Select Case CStr(c.Value)
+        Case "Open":                   Good c
+        Case "Closed":                 c.Font.Color = RGB(128, 128, 128)
+        Case "Filtered":               c.Font.Color = RGB(160, 160, 160)
+        Case "Unreachable", "Error":   Bad c
+    End Select
+End Sub
+
+' Asks which TCP ports to check (remembers the last answer).
+' Returns False if the user cancels or the list is invalid.
+Private Function AskPorts(ByVal prompt As String, ByVal allowBlank As Boolean, _
+        ByRef ports() As Long, ByRef nPorts As Long) As Boolean
+    Dim answer As String, errText As String
+    answer = InputBox(prompt, APP_NAME & " - TCP ports", GetSetting(APP_NAME, "Ports", "Last", DEFAULT_PORTS))
+    If StrPtr(answer) = 0 Then Exit Function                ' Cancel
+    If Len(Trim$(answer)) = 0 Then
+        If Not allowBlank Then Exit Function
+        nPorts = 0
+        AskPorts = True
+        Exit Function
+    End If
+    If Not ParsePorts(answer, ports, nPorts, errText) Then
+        MsgBox errText, vbExclamation, APP_NAME
+        Exit Function
+    End If
+    SaveSetting APP_NAME, "Ports", "Last", answer
+    AskPorts = True
+End Function
+
+' "22, 80,443 8000-8010" -> array of unique ports
+Private Function ParsePorts(ByVal text As String, ByRef ports() As Long, ByRef nPorts As Long, _
+        ByRef errText As String) As Boolean
+    Dim part As Variant, t As String, a As Long, b As Long, p As Long, c As New Collection, d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    text = Replace(Replace(text, ";", ","), " ", ",")
+    For Each part In Split(text, ",")
+        t = Trim$(CStr(part))
+        If Len(t) > 0 Then
+            If InStr(t, "-") > 0 Then
+                If Not IsAllDigits(Split(t, "-")(0)) Or Not IsAllDigits(Split(t, "-")(1)) Then
+                    errText = "Not a port range: " & t: Exit Function
+                End If
+                a = CLng(Split(t, "-")(0)): b = CLng(Split(t, "-")(1))
+            ElseIf IsAllDigits(t) And Len(t) <= 5 Then
+                a = CLng(t): b = a
+            Else
+                errText = "Not a port number: " & t: Exit Function
+            End If
+            If a < 1 Or b > 65535 Or a > b Then errText = "Ports must be 1-65535: " & t: Exit Function
+            For p = a To b
+                If Not d.Exists(p) Then
+                    d.Add p, True
+                    c.Add p
+                    If c.Count > MAX_PORTS Then errText = "Too many ports - the limit is " & MAX_PORTS & ".": Exit Function
+                End If
+            Next p
+        End If
+    Next part
+    If c.Count = 0 Then errText = "No ports given.": Exit Function
+    nPorts = c.Count
+    ReDim ports(0 To nPorts - 1)
+    For p = 1 To nPorts
+        ports(p - 1) = c(p)
+    Next p
+    ParsePorts = True
+End Function
+
+Private Function JoinPorts(ports() As Long, ByVal nPorts As Long) As String
+    Dim j As Long, s As String
+    For j = 0 To nPorts - 1
+        If j > 0 Then s = s & ","
+        s = s & ports(j)
+    Next j
+    JoinPorts = s
+End Function
+
+' Column header for a port, e.g. "22 SSH"
+Private Function PortLabel(ByVal port As Long) As String
+    Dim nm As String
+    Select Case port
+        Case 21: nm = "FTP"
+        Case 22: nm = "SSH"
+        Case 23: nm = "Telnet"
+        Case 25: nm = "SMTP"
+        Case 53: nm = "DNS"
+        Case 80: nm = "HTTP"
+        Case 88: nm = "Kerberos"
+        Case 110: nm = "POP3"
+        Case 135: nm = "RPC"
+        Case 139: nm = "NetBIOS"
+        Case 143: nm = "IMAP"
+        Case 389: nm = "LDAP"
+        Case 443: nm = "HTTPS"
+        Case 445: nm = "SMB"
+        Case 465, 587: nm = "SMTP"
+        Case 636: nm = "LDAPS"
+        Case 830: nm = "NETCONF"
+        Case 993: nm = "IMAPS"
+        Case 1433: nm = "SQL"
+        Case 1521: nm = "Oracle"
+        Case 2049: nm = "NFS"
+        Case 3306: nm = "MySQL"
+        Case 3389: nm = "RDP"
+        Case 5060: nm = "SIP"
+        Case 5432: nm = "Postgres"
+        Case 5900: nm = "VNC"
+        Case 5985: nm = "WinRM"
+        Case 5986: nm = "WinRM-S"
+        Case 8080: nm = "HTTP-alt"
+        Case 8443: nm = "HTTPS-alt"
+        Case 9100: nm = "Printer"
+    End Select
+    PortLabel = "TCP " & port & IIf(Len(nm) > 0, " " & nm, "")
+End Function
+
+' Snapshot of the PC's ARP table: IPv4 address -> 12 hex digit MAC.
+' Only devices on directly connected subnets appear (that's how ARP works).
+Private Function ArpTable() As Object
+    Dim d As Object, size As Long, buf() As Byte, n As Long, i As Long, base As Long
+    Dim mac As String, k As Long, ip As String
+    Set d = CreateObject("Scripting.Dictionary")
+    Set ArpTable = d
+    size = 0
+    GetIpNetTable 0, size, 0
+    If size <= 4 Then Exit Function
+    size = size + 4096                      ' room in case the table grows
+    ReDim buf(0 To size - 1)
+    If GetIpNetTable(VarPtr(buf(0)), size, 0) <> 0 Then Exit Function
+    ' MIB_IPNETTABLE: count @0, rows from @4, 24 bytes each:
+    '   index @0, physAddrLen @4, physAddr(8) @8, addr @16, type @20 (2 = invalid)
+    n = ReadLong(VarPtr(buf(0)))
+    For i = 0 To n - 1
+        base = 4 + i * 24
+        If base + 24 > size Then Exit For
+        If ReadLong(VarPtr(buf(base + 4))) = 6 And ReadLong(VarPtr(buf(base + 20))) <> 2 Then
+            mac = ""
+            For k = 0 To 5
+                mac = mac & Right$("0" & Hex$(buf(base + 8 + k)), 2)
+            Next k
+            If mac <> "000000000000" And mac <> "FFFFFFFFFFFF" Then
+                ip = buf(base + 16) & "." & buf(base + 17) & "." & buf(base + 18) & "." & buf(base + 19)
+                d(ip) = mac
+            End If
+        End If
+    Next i
+End Function
+
+'==============================================================================
+' Port Check
+'==============================================================================
+Private Sub RunPortCheck()
+    Dim items As Collection, srcDesc As String, ports() As Long, nPorts As Long
+    Dim n As Long, i As Long, j As Long, ips() As String, todo() As Boolean, res As Variant
+    Dim headers() As Variant, out() As Variant, ws As Worksheet, lo As ListObject, rowRng As Range
+    Dim wsaOk As Boolean, openList As String, nOpenHosts As Long, nBad As Long
+
+    Set items = GetInputList("Hostnames or IP addresses to port-check, separated by commas or spaces:", False, srcDesc)
+    If items Is Nothing Then Exit Sub
+    If Not AskPorts("TCP ports to check, for example:" & vbCrLf & vbCrLf & _
+                    "22,80,443,3389   or   8000-8010", False, ports, nPorts) Then Exit Sub
+
+    Application.EnableCancelKey = xlErrorHandler
+    On Error GoTo Handler
+    wsaOk = WsaInit()
+
+    n = items.Count
+    ReDim ips(1 To n), todo(1 To n)
+    For i = 1 To n
+        Application.StatusBar = APP_NAME & ": resolving " & items(i)
+        ips(i) = FirstIPv4(items(i))
+        todo(i) = (Len(ips(i)) > 0)
+    Next i
+    res = TcpScan(ips, todo, ports, nPorts, "port check")
+
+    ReDim headers(0 To 2 + nPorts)
+    headers(0) = H_HOST: headers(1) = SC_IP
+    For j = 0 To nPorts - 1
+        headers(2 + j) = PortLabel(ports(j))
+    Next j
+    headers(2 + nPorts) = SC_OPEN
+    ReDim out(1 To n, 1 To nPorts + 3)
+    For i = 1 To n
+        out(i, 1) = items(i)
+        If todo(i) Then
+            out(i, 2) = ips(i)
+            openList = ""
+            For j = 0 To nPorts - 1
+                out(i, 3 + j) = res(i, j)
+                If res(i, j) = "Open" Then
+                    If Len(openList) > 0 Then openList = openList & ", "
+                    openList = openList & ports(j)
+                End If
+            Next j
+            out(i, 3 + nPorts) = openList
+            If Len(openList) > 0 Then nOpenHosts = nOpenHosts + 1
+        Else
+            out(i, 2) = "(not found)"
+            nBad = nBad + 1
+        End If
+    Next i
+
+    Set ws = NewResultSheet("Port Check")
+    Set lo = StartResultTable(ws, "Port Check  -  TCP " & JoinPorts(ports, nPorts) & "  -  " & srcDesc, headers, n)
+    Application.ScreenUpdating = False
+    lo.DataBodyRange.Value = out
+    For i = 1 To n
+        Set rowRng = lo.DataBodyRange.Rows(i)
+        If Not todo(i) Then Bad rowRng.Cells(1, 2)
+        For j = 0 To nPorts - 1
+            ColourPortCell rowRng.Cells(1, 3 + j)
+        Next j
+    Next i
+    FinishTable lo, n
+    Application.ScreenUpdating = True
+    Application.StatusBar = False
+    MsgBox n & " host(s) checked: " & nOpenHosts & " with at least one open port" & _
+           IIf(nBad > 0, ", " & nBad & " not found in DNS", "") & "." & vbCrLf & vbCrLf & _
+           "Open = accepted the connection.  Closed = refused it.  " & _
+           "Filtered = no answer (firewall, or nothing there).", vbInformation, APP_NAME
+    GoTo Cleanup
+
+Handler:
+    Application.ScreenUpdating = True
+    Application.StatusBar = False
+    If Err.Number = 18 Then
+        MsgBox "Port check stopped.", vbInformation, APP_NAME
+    Else
+        MsgBox "Error " & Err.Number & ": " & Err.Description, vbCritical, APP_NAME
+    End If
+
+Cleanup:
+    On Error Resume Next
+    If wsaOk Then WSACleanup
+    Application.StatusBar = False
+    Application.EnableCancelKey = xlInterrupt
+End Sub
+
+' First IPv4 address for a host name or IP ("" if none)
+Private Function FirstIPv4(ByVal host As String) As String
+    Dim ip As String, item As Variant
+    ip = NumericAddress(host)
+    If Len(ip) > 0 Then
+        If InStr(ip, ":") = 0 Then FirstIPv4 = ip
+        Exit Function
+    End If
+    For Each item In LookupAddresses(host)
+        If InStr(CStr(item), ":") = 0 Then FirstIPv4 = CStr(item): Exit Function
+    Next item
+End Function
+
+'==============================================================================
+' MAC addresses: formatting and vendor lookup
+'==============================================================================
+Private Sub RunMacFormat()
+    Dim items As Collection, srcDesc As String, style As Long, n As Long, i As Long
+    Dim out() As Variant, h As String, ws As Worksheet, lo As ListObject, nBad As Long
+
+    Set items = GetInputList("MAC addresses to format, separated by commas:", True, srcDesc)
+    If items Is Nothing Then Exit Sub
+    style = AskMacStyle()
+    If style = 0 Then Exit Sub
+
+    n = items.Count
+    ReDim out(1 To n, 1 To 3)
+    For i = 1 To n
+        out(i, 1) = items(i)
+        h = MacHex(items(i))
+        If Len(h) = 0 Then
+            out(i, 2) = "Not a MAC address"
+            nBad = nBad + 1
+        Else
+            out(i, 2) = FormatMac(h, style)
+            out(i, 3) = MacVendor(h)
+        End If
+    Next i
+
+    On Error GoTo Handler
+    Set ws = NewResultSheet("MAC Addresses")
+    Set lo = StartResultTable(ws, "MAC addresses  -  " & IIf(style = MAC_CISCO, "xxxx.xxxx.xxxx", "XX:XX:XX:XX:XX:XX") & _
+                              "  -  " & srcDesc, Array("MAC (as entered)", "Formatted MAC", SC_VENDOR), n)
+    lo.DataBodyRange.Value = out
+    For i = 1 To n
+        If Len(MacHex(CStr(out(i, 1)))) = 0 Then Bad lo.DataBodyRange.Cells(i, 2)
+    Next i
+    FinishTable lo, n
+    If nBad > 0 Then MsgBox nBad & " value(s) weren't MAC addresses - see the red cells.", vbExclamation, APP_NAME
+    Exit Sub
+Handler:
+    MsgBox "Error " & Err.Number & ": " & Err.Description, vbCritical, APP_NAME
+End Sub
+
+' Asks which MAC format to use (remembers the last answer). 0 = cancelled.
+Private Function AskMacStyle() As Long
+    Dim answer As String
+    answer = InputBox("Which format?" & vbCrLf & vbCrLf & _
+                      "   1  =  xxxx.xxxx.xxxx         (e.g. aabb.ccdd.eeff)" & vbCrLf & vbCrLf & _
+                      "   2  =  XX:XX:XX:XX:XX:XX   (e.g. AA:BB:CC:DD:EE:FF)" & vbCrLf & vbCrLf & _
+                      "Type 1 or 2:", APP_NAME & " - MAC format", _
+                      GetSetting(APP_NAME, "Mac", "Style", CStr(MAC_CISCO)))
+    If StrPtr(answer) = 0 Then Exit Function
+    Select Case Trim$(answer)
+        Case "1": AskMacStyle = MAC_CISCO
+        Case "2": AskMacStyle = MAC_COLON
+        Case Else
+            MsgBox "Please type 1 or 2.", vbExclamation, APP_NAME
+            Exit Function
+    End Select
+    SaveSetting APP_NAME, "Mac", "Style", CStr(AskMacStyle)
+End Function
+
+' Any common MAC notation -> 12 upper-case hex digits ("" if it isn't a MAC)
+Private Function MacHex(ByVal s As String) As String
+    Dim i As Long, c As String, h As String
+    s = Trim$(s)
+    For i = 1 To Len(s)
+        c = UCase$(Mid$(s, i, 1))
+        If (c >= "0" And c <= "9") Or (c >= "A" And c <= "F") Then
+            h = h & c
+        ElseIf InStr(":-. ", c) = 0 Then
+            Exit Function
+        End If
+    Next i
+    If Len(h) = 12 Then MacHex = h
+End Function
+
+' 12 hex digits -> MAC_CISCO "aabb.ccdd.eeff" or MAC_COLON "AA:BB:CC:DD:EE:FF"
+' (style 3 = "AA-BB-CC-DD-EE-FF", 4 = "AABBCCDDEEFF")
+Private Function FormatMac(ByVal h As String, ByVal style As Long) As String
+    Select Case style
+        Case MAC_CISCO
+            h = LCase$(h)
+            FormatMac = Mid$(h, 1, 4) & "." & Mid$(h, 5, 4) & "." & Mid$(h, 9, 4)
+        Case 3
+            FormatMac = Mid$(h, 1, 2) & "-" & Mid$(h, 3, 2) & "-" & Mid$(h, 5, 2) & "-" & _
+                        Mid$(h, 7, 2) & "-" & Mid$(h, 9, 2) & "-" & Mid$(h, 11, 2)
+        Case 4
+            FormatMac = h
+        Case Else
+            FormatMac = Mid$(h, 1, 2) & ":" & Mid$(h, 3, 2) & ":" & Mid$(h, 5, 2) & ":" & _
+                        Mid$(h, 7, 2) & ":" & Mid$(h, 9, 2) & ":" & Mid$(h, 11, 2)
+    End Select
+End Function
+
+' Vendor from the first 3 bytes (OUI), using the IEEE list installed with NetTools.
+Private Function MacVendor(ByVal h As String) As String
+    Dim oui As Object
+    If Len(h) <> 12 Then Exit Function
+    ' Second-lowest bit of the first byte set = locally administered (random/private) MAC
+    If (CLng("&H" & Left$(h, 2)) And 2) <> 0 Then
+        MacVendor = "(private / random MAC)"
+        Exit Function
+    End If
+    Set oui = OuiList()
+    If oui.Count = 0 Then
+        MacVendor = ""
+    ElseIf oui.Exists(Left$(h, 6)) Then
+        MacVendor = oui(Left$(h, 6))
+    Else
+        MacVendor = "(unknown)"
+    End If
+End Function
+
+' Loads oui.txt ("AABBCC<tab>Vendor" per line) once. Looks next to the add-in,
+' then in %APPDATA%\NetTools (where the MSI puts it).
+Private Function OuiList() As Object
+    Dim fso As Object, path As Variant, st As Object, txt As String, line As Variant, l As String
+    If Not mOuiTried Then
+        mOuiTried = True
+        Set mOui = CreateObject("Scripting.Dictionary")
+        On Error Resume Next
+        Set fso = CreateObject("Scripting.FileSystemObject")
+        For Each path In Array(ThisWorkbook.Path & "\oui.txt", Environ$("APPDATA") & "\NetTools\oui.txt")
+            If fso.FileExists(CStr(path)) Then
+                Set st = CreateObject("ADODB.Stream")
+                st.Type = 2
+                st.Charset = "utf-8"
+                st.Open
+                st.LoadFromFile CStr(path)
+                txt = st.ReadText
+                st.Close
+                For Each line In Split(txt, vbLf)
+                    l = Replace(CStr(line), vbCr, "")
+                    If Len(l) > 7 Then
+                        If Mid$(l, 7, 1) = vbTab Then mOui(UCase$(Left$(l, 6))) = Mid$(l, 8)
+                    End If
+                Next line
+                Exit For
+            End If
+        Next path
+        On Error GoTo 0
+    End If
+    Set OuiList = mOui
 End Function
 
 ' Reverse lookup straight from DNS (DnsQuery PTR) - quick even when there is
@@ -1555,4 +2307,28 @@ Public Function NT_INSUBNET(ByVal ip As String, ByVal subnet As String) As Varia
     If Not info.Ok Then NT_INSUBNET = info.ErrorText: Exit Function
     If Not ParseIPv4(CleanHost(ip), v) Then NT_INSUBNET = "Not an IPv4 address: " & ip: Exit Function
     NT_INSUBNET = (v >= info.Network And v <= info.Broadcast)
+End Function
+
+' =NT_MAC("aa-bb-cc-dd-ee-ff", "cisco")  -> "aabb.ccdd.eeff"
+' style: "cisco" (or 1), "colon" (or 2, the default), "dash", "bare"
+Public Function NT_MAC(ByVal mac As String, Optional ByVal style As Variant = "colon") As String
+    Dim h As String, st As Long
+    h = MacHex(mac)
+    If Len(h) = 0 Then NT_MAC = "Not a MAC address": Exit Function
+    Select Case LCase$(Trim$(CStr(style)))
+        Case "cisco", "1", "dot", "dotted": st = MAC_CISCO
+        Case "dash", "hyphen", "windows":   st = 3
+        Case "bare", "plain", "none":       st = 4
+        Case Else:                           st = MAC_COLON
+    End Select
+    NT_MAC = FormatMac(h, st)
+End Function
+
+' =NT_VENDOR("00:1b:54:12:34:56")  -> "Cisco Systems, Inc"
+Public Function NT_VENDOR(ByVal mac As String) As String
+    Dim h As String
+    h = MacHex(mac)
+    If Len(h) = 0 Then NT_VENDOR = "Not a MAC address": Exit Function
+    h = MacVendor(h)
+    If Len(h) = 0 Then NT_VENDOR = "(vendor list not installed)" Else NT_VENDOR = h
 End Function

@@ -9,7 +9,10 @@
   No admin rights are needed. Uninstall from Settings > Apps.
 
   Built by ..\build.ps1 -Msi, which passes:
-    -d Version=1.0.0  -d XlamPath=..\dist\NetTools.xlam
+    -d Version=x.y.z  -d XlamPath=..\dist\NetTools.xlam  -d OuiPath=..\dist\oui.txt
+
+  oui.txt (MAC vendor list) goes to %APPDATA%\NetTools - not XLSTART,
+  because Excel would try to open every file in XLSTART.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="NetTools for Excel"
@@ -29,6 +32,14 @@
     <Property Id="ARPCOMMENTS" Value="Excel ribbon tab: Check DNS, DNS Only, Ping Only" />
 
     <StandardDirectory Id="AppDataFolder">
+      <Directory Id="NetToolsDataDir" Name="NetTools">
+        <Component Id="NetToolsOui" Guid="5B0E2F64-7C1A-4E4B-9C3F-2A6D8E1B7F40">
+          <File Id="OuiTxt" Name="oui.txt" Source="$(var.OuiPath)" />
+          <RegistryValue Root="HKCU" Key="Software\NetTools\ExcelAddin"
+                         Name="OuiVersion" Type="string" Value="$(var.Version)" KeyPath="yes" />
+          <RemoveFolder Id="RemoveNetToolsDataDir" Directory="NetToolsDataDir" On="uninstall" />
+        </Component>
+      </Directory>
       <Directory Id="MicrosoftDir" Name="Microsoft">
         <Directory Id="ExcelDir" Name="Excel">
           <Directory Id="XLSTARTDIR" Name="XLSTART">
@@ -51,6 +62,7 @@
 
     <Feature Id="Main" Title="NetTools for Excel">
       <ComponentRef Id="NetToolsAddin" />
+      <ComponentRef Id="NetToolsOui" />
     </Feature>
   </Package>
 </Wix>

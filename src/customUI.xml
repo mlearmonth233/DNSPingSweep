@@ -30,6 +30,13 @@
                   onAction="NT_OnPingOnly"
                   screentip="Ping Only"
                   supertip="Ping each host 4 times and report status, replies, average latency and TTL on the 'Ping' sheet." />
+          <button id="btnPortCheck"
+                  label="Port Check"
+                  size="normal"
+                  imageMso="AdpPrimaryKey"
+                  onAction="NT_OnPortCheck"
+                  screentip="Port Check"
+                  supertip="Checks whether TCP ports (e.g. 22, 443, 3389) are open on each selected host. Open = accepted, Closed = refused, Filtered = no answer. Results go on the 'Port Check' sheet." />
         </group>
 
         <group id="grpPath" label="Path">
@@ -49,7 +56,7 @@
                   imageMso="RefreshAll"
                   onAction="NT_OnSubnetScan"
                   screentip="Subnet Scan"
-                  supertip="Pings every address in a subnet (10.1.4.0/24 or 10.1.4.0 255.255.255.0) and looks up its reverse DNS name, checking it resolves back. Each subnet goes on its own 'Scan' sheet, overwritten when you scan it again. Select an empty cell to type the subnet." />
+                  supertip="Pings every address in a subnet (10.1.4.0/24 or 10.1.4.0 255.255.255.0) - hundreds at once - and shows MAC address + vendor (local subnets), reverse DNS and, optionally, open TCP ports. Each subnet goes on its own 'Scan' sheet, overwritten when you scan it again. Select an empty cell to type the subnet." />
           <button id="btnSubnetCalc"
                   label="Subnet Calc"
                   size="large"
@@ -57,6 +64,16 @@
                   onAction="NT_OnSubnetCalc"
                   screentip="Subnet Calculator"
                   supertip="For each selected subnet (10.1.4.0/22 or 10.1.4.7 255.255.252.0): network, mask, wildcard, first/last usable, broadcast and host count, on the 'Subnets' sheet. Select an empty cell to type subnets instead." />
+        </group>
+
+        <group id="grpMac" label="MAC">
+          <button id="btnMacFormat"
+                  label="MAC Format"
+                  size="large"
+                  imageMso="FormatPainter"
+                  onAction="NT_OnMacFormat"
+                  screentip="MAC Format"
+                  supertip="Reformats the selected MAC addresses as xxxx.xxxx.xxxx or XX:XX:XX:XX:XX:XX (you choose) and looks up the vendor. Results go on the 'MAC Addresses' sheet." />
         </group>
 
         <group id="grpTools" label="Help">

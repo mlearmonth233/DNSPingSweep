@@ -7,8 +7,10 @@
        workbook and saves it as an add-in (.xlam).
     2. Adds the ribbon (src\customUI.xml) and the add-in's title/description
        to the .xlam package.
-    3. With -Msi: packages the .xlam into dist\NetTools-<version>.msi with
-       the WiX Toolset (installed automatically as a .NET tool if missing).
+    3. With -Msi: downloads the MAC vendor list (IEEE OUI registry) to
+       dist\oui.txt and packages it with the .xlam into
+       dist\NetTools-<version>.msi with the WiX Toolset (installed
+       automatically as a .NET tool if missing).
 
     Needs Windows with desktop Excel (2010 or later). Step 1 needs
     "Trust access to the VBA project object model"; the script switches it
@@ -41,6 +43,7 @@ $uiFile   = Join-Path $srcDir 'customUI.xml'
 $xlamFile = Join-Path $distDir 'NetTools.xlam'
 $wxsFile  = Join-Path $root 'installer\NetTools.wxs'
 $msiFile  = Join-Path $distDir "NetTools-$Version.msi"
+$ouiFile  = Join-Path $distDir 'oui.txt'
 $wixVersion = '5.0.2'
 
 New-Item -ItemType Directory -Force -Path $distDir | Out-Null
@@ -168,9 +171,47 @@ if ($null -eq $wix) {
     $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
 }
 
+# MAC vendor list: IEEE registry, falling back to Wireshark's copy of it.
+# Written as "AABBCC<tab>Vendor" lines. Downloaded once per build.
+function Get-OuiLines {
+    $ua = @{ 'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) NetTools-build' }
+    try {
+        $r = Invoke-WebRequest -UseBasicParsing -Headers $ua -TimeoutSec 120 -Uri 'https://standards-oui.ieee.org/oui/oui.csv'
+        $text = [Text.Encoding]::UTF8.GetString($r.RawContentStream.ToArray())
+        $lines = $text | ConvertFrom-Csv | Where-Object { $_.Assignment -match '^[0-9A-Fa-f]{6}$' } |
+            ForEach-Object { "{0}`t{1}" -f $_.Assignment.ToUpper(), (($_.'Organization Name' -replace '\s+', ' ').Trim()) }
+        if ($lines.Count -gt 1000) { return $lines }
+    } catch { Write-Warning "IEEE OUI download failed: $($_.Exception.Message)" }
+    try {
+        $r = Invoke-WebRequest -UseBasicParsing -Headers $ua -TimeoutSec 120 -Uri 'https://www.wireshark.org/download/automated/data/manuf'
+        $text = [Text.Encoding]::UTF8.GetString($r.RawContentStream.ToArray())
+        $lines = foreach ($l in ($text -split "`n")) {
+            if ($l -match '^([0-9A-Fa-f]{2}):([0-9A-Fa-f]{2}):([0-9A-Fa-f]{2})\s+(\S+)(?:\s+(.+))?$') {
+                $name = if ($matches[5]) { $matches[5].Trim() } else { $matches[4] }
+                "{0}{1}{2}`t{3}" -f $matches[1].ToUpper(), $matches[2].ToUpper(), $matches[3].ToUpper(), $name
+            }
+        }
+        if ($lines.Count -gt 1000) { return $lines }
+    } catch { Write-Warning "Wireshark manuf download failed: $($_.Exception.Message)" }
+    return @()
+}
+
+Write-Host "Downloading MAC vendor list ..."
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+$ouiLines = @(Get-OuiLines)
+if ($ouiLines.Count -gt 0) {
+    [IO.File]::WriteAllLines($ouiFile, [string[]]$ouiLines, (New-Object Text.UTF8Encoding($false)))
+    Write-Host "  $($ouiLines.Count) vendors"
+} elseif (Test-Path $ouiFile) {
+    Write-Warning "Using the vendor list from the last build."
+} else {
+    Write-Warning "No MAC vendor list - the Vendor column will be empty. Re-run the build when online."
+    [IO.File]::WriteAllText($ouiFile, "# vendor list unavailable`n")
+}
+
 Write-Host "Building MSI ..."
 if (Test-Path $msiFile) { Remove-Item $msiFile -Force }
-wix build $wxsFile -arch x86 -d "Version=$Version" -d "XlamPath=$xlamFile" -o $msiFile
+wix build $wxsFile -arch x86 -d "Version=$Version" -d "XlamPath=$xlamFile" -d "OuiPath=$ouiFile" -o $msiFile
 if ($LASTEXITCODE -ne 0) { throw "wix build failed." }
 Remove-Item (Join-Path $distDir '*.wixpdb') -ErrorAction SilentlyContinue
 Write-Host "Built $msiFile" -ForegroundColor Green

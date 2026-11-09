@@ -1,6 +1,7 @@
 # DNSPingSweep: NetTools for Excel
 
-DNS resolution, ping, traceroute, subnet scan and subnet calculator tool. An Excel add-in that adds
+DNS resolution, ping, port check, traceroute, subnet scan, subnet calculator
+and MAC address tool. An Excel add-in that adds
 a **NetTools** tab to the ribbon:
 
 | Button | What it does |
@@ -8,15 +9,17 @@ a **NetTools** tab to the ribbon:
 | **Check DNS** | For each IP address or hostname: forward lookup, reverse (PTR) lookup, a forward/reverse match check, and 4 pings |
 | **DNS Only** | The lookups without the ping (faster) |
 | **Ping Only** | 4 pings per host: status, replies, average latency, TTL |
+| **Port Check** | Is TCP 22 / 443 / 3389 / ... open on each host? |
 | **Traceroute** | Hop-by-hop path to each host (3 probes per hop, like `tracert`) |
-| **Subnet Scan** | Pings every address in a subnet and looks up its reverse DNS (PTR) name |
+| **Subnet Scan** | Every address in a subnet: ping, MAC address + vendor, reverse DNS, and optionally TCP ports. Hundreds at once |
 | **Subnet Calc** | Network, mask, wildcard, first/last usable, broadcast and host count for each subnet |
+| **MAC Format** | Reformats MAC addresses as `xxxx.xxxx.xxxx` or `XX:XX:XX:XX:XX:XX` (you choose) and shows the vendor |
 | **About** | Short help |
 
 **Results always go on a new sheet as a formatted Excel table with headers.
 The cells you select are never changed or overwritten.** Each run adds its
 own sheet (`DNS Check`, `DNS Lookup`, `Ping`, `Subnets`, `Trace server1`,
-`Scan 10.1.4.0_24`)
+`Scan 10.1.4.0_24`, `Port Check`, `MAC Addresses`)
 with a title, the time it ran, and a table you can sort and filter.
 Running the same button again **overwrites** its sheet with the new
 results. NetTools only overwrites sheets it created: if one of your own
@@ -63,28 +66,79 @@ answers is green. The trace stops at the destination, on an "unreachable"
 reply, after 30 hops, or after 5 hops in a row with no reply (often a
 firewall blocking ICMP). IPv4 only. Up to 20 hosts per run.
 
+### Port Check results
+
+Select hosts (or type them in), then enter the TCP ports, e.g. `22,80,443,3389`
+or `8000-8010` (up to 64 ports; NetTools remembers your last list). The
+`Port Check` sheet has one column per port:
+
+- **Open**: the port accepted the connection (green).
+- **Closed**: the host refused it. The host is up, but nothing is listening.
+- **Filtered**: no answer within 2.5 seconds, usually a firewall dropping it
+  (or nothing at that address).
+- **Unreachable**: a router said the host or network can't be reached.
+
+Plus an **Open Ports** column listing the open ones. Many connections are
+tried at once, so a long list is still quick.
+
 ### Subnet Scan results
 
 Type or select a subnet as `10.1.4.0/24` or `10.1.4.0 255.255.255.0` (any
-address inside it works too). NetTools pings every usable address (500 ms timeout), pings it once more
-if the first gets no reply, and looks up its PTR record straight from DNS. Each
-subnet gets its own sheet, e.g. `Scan 10.1.4.0_24`, with a table of:
+address inside it works too). NetTools then asks for TCP ports to check on
+every address. Leave it blank to skip the port check.
+
+NetTools pings up to 256 addresses at once (1 second timeout) and pings
+anything that didn't answer a second time. It then reads MAC addresses from
+the PC's ARP table, looks up each PTR record straight from DNS, and runs the
+port check if you asked for one. A /24 takes roughly 5-15 seconds without
+ports.
+
+Each subnet gets its own sheet, e.g. `Scan 10.1.4.0_24`:
 
 | Column | Example |
 |---|---|
-| IP Address | `10.1.4.17` (green if it answered) |
+| IP Address | `10.1.4.17`: green if it answered ping, yellow if it's there (MAC or open port) but blocks ping |
 | Ping | `Up`, `No reply`, `Destination host unreachable` |
 | Latency (ms) | `2` |
 | TTL | `255` |
+| MAC Address | `00:1b:54:aa:bb:cc`, in your chosen MAC format |
+| Vendor | `Cisco Systems, Inc` / `(private / random MAC)` |
 | Reverse DNS (PTR) | `ap-floor2-03.corp.example.com` |
 | Fwd/Rev Match | `Yes` if the PTR name resolves back to this IP |
+| TCP 22 SSH, TCP 443 HTTPS, ... | `Open` / `Closed` / `Filtered` (only if you entered ports) |
+| Open Ports | `22, 443` |
 
-A summary line above the table, and a pop-up at the end, give the count of
-addresses that are up and that have PTR records. Use the table's filter
-arrows to show only `Up` addresses or only ones with a PTR. Up to 4,096
-addresses (a /20) per subnet. NetTools asks before anything bigger than a
-/24. A /24 where nothing answers takes about 4 minutes. Esc stops the scan
-and keeps what's been scanned so far.
+**MAC addresses only appear for subnets your PC is directly connected to**
+(same VLAN). That's how ARP works: for remote subnets the router answers
+on the devices' behalf. They do appear for devices that block ping, which
+helps you find devices hiding behind a firewall.
+
+The summary line above the table and the pop-up at the end count the
+devices found, the ones answering ping, the ones with a MAC, open ports and
+PTR records. Use the filter arrows to show only what you need. Up to 4,096
+addresses (a /20) per subnet; NetTools asks before anything bigger than a
+/24. Esc stops the scan.
+
+### MAC Format
+
+Select a column of MAC addresses in any notation (`aabb.ccdd.eeff`,
+`AA:BB:CC:DD:EE:FF`, `AA-BB-CC-DD-EE-FF`, `AABBCCDDEEFF`), click
+**MAC Format**, and choose:
+
+- `1`: `xxxx.xxxx.xxxx` (Cisco style, lower case), e.g. `aabb.ccdd.eeff`
+- `2`: `XX:XX:XX:XX:XX:XX` (upper case), e.g. `AA:BB:CC:DD:EE:FF`
+
+The `MAC Addresses` sheet lists each original, the formatted MAC and the
+vendor. Your choice is remembered and also used for the MAC column in
+Subnet Scan.
+
+### MAC vendor list
+
+Vendors come from the IEEE OUI registry. The build downloads it once
+(about 35,000 vendors), and the MSI installs it as
+`%APPDATA%\NetTools\oui.txt`. Lookups happen on your PC: nothing is sent
+anywhere when you use the add-in. **About** shows whether the list is
+installed. If you install the `.xlam` by hand, put `oui.txt` next to it.
 
 ### Subnet Calc results
 
@@ -115,6 +169,8 @@ Also available in formulas, if you want results next to your own data:
 =NT_SUBNET(A2)                  10.1.4.0/22 (10.1.4.1 - 10.1.7.254, 1022 hosts)
 =NT_SUBNET(A2, "mask")          255.255.252.0
 =NT_INSUBNET(B2, A2)            TRUE if the IP in B2 is inside subnet A2
+=NT_MAC(A2, "cisco")            aabb.ccdd.eeff   ("colon", "dash", "bare" too)
+=NT_VENDOR(A2)                  Cisco Systems, Inc
 ```
 
 `NT_SUBNET` fields: `cidr`, `network`, `mask`, `wildcard`, `first`, `last`,
@@ -124,7 +180,7 @@ Also available in formulas, if you want results next to your own data:
 
 ### MSI (recommended)
 
-Double-click `NetTools-2.2.1.msi` and close Excel first if it's open. No admin
+Double-click `NetTools-3.0.0.msi` and close Excel first if it's open. No admin
 rights are needed. The installer puts `NetTools.xlam` in your Excel startup
 folder (`%APPDATA%\Microsoft\Excel\XLSTART`). Excel loads it every time it
 starts, and because that folder is one of Office's default trusted
@@ -132,7 +188,7 @@ locations, the macros run without a security prompt.
 
 - Uninstall: **Settings > Apps > NetTools for Excel**.
 - Upgrade: run a newer MSI. It replaces the old version.
-- Silent / Intune / SCCM: `msiexec /i NetTools-2.2.1.msi /qn`. This is a
+- Silent / Intune / SCCM: `msiexec /i NetTools-3.0.0.msi /qn`. This is a
   **per-user** MSI, so deploy it in the *user* context.
 
 If your company uses Group Policy to turn off trusted locations or block
@@ -163,6 +219,9 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -Msi     # + dist\NetTools-
 - The script drives Excel in the background. It switches on *Trust access to
   the VBA project object model* for the build and then puts the setting
   back the way it was.
+- `-Msi` downloads the MAC vendor list from the IEEE (falling back to
+  Wireshark's copy). If the PC is offline, the MSI still builds, but
+  without vendor names.
 - `-Msi` uses the [WiX Toolset](https://wixtoolset.org/) v5. If WiX isn't
   installed, the script installs it as a .NET global tool, which needs the
   [.NET SDK](https://dotnet.microsoft.com/download) 6 or later.
@@ -173,7 +232,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -Msi     # + dist\NetTools-
 
 | File | Purpose |
 |---|---|
-| `src/NetTools.bas` | All the VBA: ribbon callbacks, DNS (ws2_32), ping (WMI), traceroute + subnet scan (ICMP API, DnsQuery), subnet maths, worksheet functions |
+| `src/NetTools.bas` | All the VBA: ribbon callbacks, DNS (ws2_32), ping (WMI), traceroute + subnet scan (ICMP API, ARP table, DnsQuery), port check (Winsock), MAC formatting + vendor lookup, subnet maths, worksheet functions |
 | `src/customUI.xml` | Ribbon tab definition |
 | `installer/NetTools.wxs` | WiX source for the per-user MSI |
 | `build.ps1` | Builds the `.xlam` and, with `-Msi`, the MSI |
