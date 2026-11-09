@@ -1,29 +1,39 @@
 # DNSPingSweep: NetTools for Excel
 
-DNS resolution and ping tool. An Excel add-in that adds a **NetTools** tab to the ribbon:
+DNS resolution, ping, traceroute and subnet tool. An Excel add-in that adds
+a **NetTools** tab to the ribbon:
 
 | Button | What it does |
 |---|---|
-| **Check DNS** | For every IP address or hostname in the selected column: forward lookup, reverse (PTR) lookup, a forward/reverse match check, and a ping |
+| **Check DNS** | For each IP address or hostname: forward lookup, reverse (PTR) lookup, a forward/reverse match check, and 4 pings |
 | **DNS Only** | The lookups without the ping (faster) |
-| **Ping Only** | Ping status, replies, average latency and TTL |
-| **Clear Results** | Removes the NetTools result columns next to the selected column |
+| **Ping Only** | 4 pings per host: status, replies, average latency, TTL |
+| **Traceroute** | Hop-by-hop path to each host (3 probes per hop, like `tracert`) |
+| **Subnet Calc** | Network, mask, wildcard, first/last usable, broadcast and host count for each subnet |
 | **About** | Short help |
+
+**Results always go on a new sheet as a formatted Excel table with headers.
+The cells you select are never changed or overwritten.** Each run adds its
+own sheet (`DNS Check`, `DNS Check 2`, `Ping`, `Subnets`, `Trace server1`,
+...) with a title, the time it ran, and a table you can sort and filter.
+Delete the sheet when you no longer need it.
 
 ## Using it
 
-1. Put IP addresses and/or hostnames in a column. A header such as
-   `Hostname` or `IP Address` is fine; NetTools spots it and skips it.
+1. Put IP addresses, hostnames or subnets in a column. A header such as
+   `Hostname`, `IP Address` or `Subnet` is fine; NetTools spots it and skips it.
 2. Select the column, a range in it, or just its first cell (NetTools then
    runs down to the last value in the column).
-3. Click **Check DNS**. Results go into the columns to the right. NetTools
-   asks before it overwrites anything, and it can insert new columns
-   instead. Press **Esc** to stop a long run.
+   Or select an **empty cell** and NetTools asks you to type them in
+   (comma separated).
+3. Click a button. The new results sheet opens and fills in as it goes.
+   Press **Esc** to stop a long run; what's done so far is kept.
 
-Results for **Check DNS**:
+### Check DNS results
 
 | Column | Example |
 |---|---|
+| Host / IP | what was checked |
 | Input Type | `Hostname` or `IP` |
 | Resolved IP(s) | `10.1.2.3, fe80::1` (IPv4 first) or `(not found)` |
 | Reverse DNS (PTR) | `sw-core-01.corp.example.com` or `(no PTR record)` |
@@ -33,34 +43,61 @@ Results for **Check DNS**:
 | Avg Latency (ms) | `3` |
 | TTL | `254` |
 
-Each host gets 4 pings, like Windows `ping`. Ping and match cells are
-coloured green (all good), yellow (packet loss / mismatch) or red (down / not found).
+Cells are coloured green (all good), yellow (packet loss / mismatch) or red
+(down / not found).
 
 **Fwd/Rev Match** means:
 - for a **hostname**: the PTR record of its first address is the same name
   (`server1` matches `server1.corp.example.com`);
 - for an **IP**: its PTR name resolves back to that same IP.
 
+### Traceroute results
+
+One sheet per host, with a table of: Hop, Address, Hostname (PTR),
+Probe 1-3 (ms, `*` = no reply) and a Note. The row where the destination
+answers is green. The trace stops at the destination, on an "unreachable"
+reply, after 30 hops, or after 5 hops in a row with no reply (often a
+firewall blocking ICMP). IPv4 only. Up to 20 hosts per run.
+
+### Subnet Calc results
+
+Accepts `10.1.4.0/22`, `10.1.4.7/22` (any address in the subnet),
+`10.1.4.7 255.255.252.0` or `10.1.4.7/255.255.252.0`. Columns:
+Subnet (as entered), Network/Prefix, Network Address, Subnet Mask,
+Wildcard Mask, First Usable, Last Usable, Broadcast Address, Usable Hosts,
+Total Addresses. /31 counts both addresses as usable (point-to-point links)
+and /32 is a single host. IPv4 only.
+
+### Speed
+
 Lookups go through the Windows resolver, so the answers match what the PC
 itself sees (DNS suffixes, hosts file and so on). Ping uses WMI, so no
 command windows pop up. Each host gets 4 pings (`PING_COUNT`), and each
 ping waits up to 1 second (`PING_TIMEOUT_MS`), both set at the top of
-`src/NetTools.bas`. Hosts are checked one at a time, so a host that is up
-takes a fraction of a second, and a host that is down takes about 4 seconds.
+`src/NetTools.bas`. Hosts are checked one at a time: a host that is up
+takes a fraction of a second, a host that is down about 4 seconds.
 
-It also adds worksheet functions you can use in formulas:
+### Worksheet functions
+
+Also available in formulas, if you want results next to your own data:
 
 ```
-=NT_RESOLVE(A2)    10.1.2.3
-=NT_PTR(A2)        server1.corp.example.com
-=NT_PING(A2)       Up (4/4, 3 ms)
+=NT_RESOLVE(A2)                 10.1.2.3
+=NT_PTR(A2)                     server1.corp.example.com
+=NT_PING(A2)                    Up (4/4, 3 ms)
+=NT_SUBNET(A2)                  10.1.4.0/22 (10.1.4.1 - 10.1.7.254, 1022 hosts)
+=NT_SUBNET(A2, "mask")          255.255.252.0
+=NT_INSUBNET(B2, A2)            TRUE if the IP in B2 is inside subnet A2
 ```
+
+`NT_SUBNET` fields: `cidr`, `network`, `mask`, `wildcard`, `first`, `last`,
+`broadcast`, `hosts`, `range`, `prefix`.
 
 ## Install
 
 ### MSI (recommended)
 
-Double-click `NetTools-1.1.0.msi` and close Excel first if it's open. No admin
+Double-click `NetTools-2.0.0.msi` and close Excel first if it's open. No admin
 rights are needed. The installer puts `NetTools.xlam` in your Excel startup
 folder (`%APPDATA%\Microsoft\Excel\XLSTART`). Excel loads it every time it
 starts, and because that folder is one of Office's default trusted
@@ -68,7 +105,7 @@ locations, the macros run without a security prompt.
 
 - Uninstall: **Settings > Apps > NetTools for Excel**.
 - Upgrade: run a newer MSI. It replaces the old version.
-- Silent / Intune / SCCM: `msiexec /i NetTools-1.1.0.msi /qn`. This is a
+- Silent / Intune / SCCM: `msiexec /i NetTools-2.0.0.msi /qn`. This is a
   **per-user** MSI, so deploy it in the *user* context.
 
 If your company uses Group Policy to turn off trusted locations or block
@@ -109,7 +146,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -Msi     # + dist\NetTools-
 
 | File | Purpose |
 |---|---|
-| `src/NetTools.bas` | All the VBA: ribbon callbacks, DNS (ws2_32), ping (WMI), worksheet functions |
+| `src/NetTools.bas` | All the VBA: ribbon callbacks, DNS (ws2_32), ping (WMI), traceroute (ICMP API), subnet maths, worksheet functions |
 | `src/customUI.xml` | Ribbon tab definition |
 | `installer/NetTools.wxs` | WiX source for the per-user MSI |
 | `build.ps1` | Builds the `.xlam` and, with `-Msi`, the MSI |

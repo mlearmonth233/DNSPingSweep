@@ -6,15 +6,24 @@ Attribute VB_Name = "NetTools"
 '             and ping for a column of IP addresses or hostnames.
 ' DNS Only  : the lookups without the ping.
 ' Ping Only : status, latency and TTL.
+' Traceroute: hop-by-hop path to a host (3 probes per hop, like tracert).
+'
+' Results always go on a NEW sheet as an Excel table - the data you select
+' is never changed.
+' Subnet Calc: network, mask, wildcard, host range, broadcast and host
+'             count for a column of subnets (10.1.4.0/22, 10.1.4.7 255.255.252.0).
 '
 ' DNS uses the Windows resolver (ws2_32 getaddrinfo / getnameinfo), so it
 ' answers exactly as the PC would (hosts file, DNS suffixes, etc.).
 ' Ping uses WMI Win32_PingStatus - no console windows flash up.
+' Traceroute uses the ICMP API (iphlpapi IcmpSendEcho) with a rising TTL.
 '
 ' Worksheet functions are included too:
 '   =NT_RESOLVE(A2)   -> IP address(es) for a hostname
 '   =NT_PTR(A2)       -> reverse DNS name for an IP (or a hostname's IP)
 '   =NT_PING(A2)      -> "Up (4/4, 12 ms)" / "Timed out" / ...
+'   =NT_SUBNET(A2, "network")   -> "10.1.4.0"  (see NT_SUBNET for fields)
+'   =NT_INSUBNET(B2, A2)        -> TRUE if the IP in B2 is inside subnet A2
 '
 ' Requires Excel 2010 or later (VBA7), 32- or 64-bit, on Windows.
 '==============================================================================
@@ -24,9 +33,10 @@ Option Explicit
 Private Const PING_COUNT As Long = 4             ' echo requests per host (like Windows ping)
 Private Const PING_TIMEOUT_MS As Long = 1000     ' per echo request
 Private Const APP_NAME As String = "NetTools"
-Private Const APP_VERSION As String = "1.1.0"
+Private Const APP_VERSION As String = "2.0.0"
 
 ' ---- Result column headers ---------------------------------------------------
+Private Const H_HOST As String = "Host / IP"
 Private Const H_TYPE As String = "Input Type"
 Private Const H_IPS As String = "Resolved IP(s)"
 Private Const H_PTR As String = "Reverse DNS (PTR)"
@@ -36,6 +46,20 @@ Private Const H_PING As String = "Ping"
 Private Const H_REPLIES As String = "Replies"
 Private Const H_LAT As String = "Avg Latency (ms)"
 Private Const H_TTL As String = "TTL"
+
+' ---- Subnet calculator column headers ---------------------------------------
+Private Const S_INPUT As String = "Subnet (as entered)"
+Private Const S_CIDR As String = "Network/Prefix"
+Private Const S_NET As String = "Network Address"
+Private Const S_MASK As String = "Subnet Mask"
+Private Const S_WILD As String = "Wildcard Mask"
+Private Const S_FIRST As String = "First Usable"
+Private Const S_LAST As String = "Last Usable"
+Private Const S_BCAST As String = "Broadcast Address"
+Private Const S_HOSTS As String = "Usable Hosts"
+Private Const S_TOTAL As String = "Total Addresses"
+Private Const RESULT_TABLE_STYLE As String = "TableStyleMedium2"
+Private Const RESULT_HEADER_ROW As Long = 4
 
 ' ---- Winsock -----------------------------------------------------------------
 Private Const AF_INET As Long = 2
@@ -74,7 +98,39 @@ Private Declare PtrSafe Function getnameinfo Lib "ws2_32.dll" ( _
 Private Declare PtrSafe Sub CopyMemory Lib "kernel32" Alias "RtlMoveMemory" ( _
     ByRef Destination As Any, ByVal Source As LongPtr, ByVal Length As LongPtr)
 
+' ---- ICMP (traceroute) -------------------------------------------------------
+Private Const TRACE_MAX_HOPS As Long = 30
+Private Const TRACE_PROBES As Long = 3
+Private Const TRACE_TIMEOUT_MS As Long = 1000
+Private Const TRACE_GIVE_UP_AFTER As Long = 5    ' stop after this many silent hops in a row
+Private Const TRACE_MAX_HOSTS As Long = 20
+Private Const IP_SUCCESS As Long = 0
+Private Const IP_REQ_TIMED_OUT As Long = 11010
+Private Const IP_TTL_EXPIRED_TRANSIT As Long = 11013
+
+Private Declare PtrSafe Function IcmpCreateFile Lib "iphlpapi.dll" () As LongPtr
+Private Declare PtrSafe Function IcmpCloseHandle Lib "iphlpapi.dll" (ByVal IcmpHandle As LongPtr) As Long
+Private Declare PtrSafe Function IcmpSendEcho Lib "iphlpapi.dll" ( _
+    ByVal IcmpHandle As LongPtr, ByVal DestinationAddress As Long, _
+    ByVal RequestData As LongPtr, ByVal RequestSize As Integer, _
+    ByVal RequestOptions As LongPtr, ByVal ReplyBuffer As LongPtr, _
+    ByVal ReplySize As Long, ByVal Timeout As Long) As Long
+
 Private mWmi As Object
+
+' Result of parsing/calculating one IPv4 subnet (addresses as 0..2^32-1)
+Private Type SubnetInfo
+    Ok As Boolean
+    ErrorText As String
+    Address As Double       ' the address as typed (may be a host inside the subnet)
+    Prefix As Long
+    Network As Double
+    Broadcast As Double
+    FirstHost As Double
+    LastHost As Double
+    Mask As Double
+    Hosts As Double
+End Type
 
 ' Result of checking one host
 Private Type HostResult
@@ -107,18 +163,26 @@ Public Sub NT_OnPingOnly(control As IRibbonControl)
     RunChecks False, True
 End Sub
 
-Public Sub NT_OnClearResults(control As IRibbonControl)
-    ClearResults
+Public Sub NT_OnTraceroute(control As IRibbonControl)
+    RunTraceroute
+End Sub
+
+Public Sub NT_OnSubnetCalc(control As IRibbonControl)
+    RunSubnetCalc
 End Sub
 
 Public Sub NT_OnAbout(control As IRibbonControl)
     MsgBox APP_NAME & " " & APP_VERSION & vbCrLf & vbCrLf & _
-        "1. Select a column of IP addresses or hostnames" & vbCrLf & _
-        "   (select just the first cell to run to the end of the list)." & vbCrLf & _
-        "2. Click Check DNS, DNS Only or Ping Only." & vbCrLf & _
-        "3. Results appear in the columns to the right. Press Esc to stop." & vbCrLf & vbCrLf & _
-        "A header row (e.g. 'Hostname' or 'IP Address') is detected and skipped." & vbCrLf & vbCrLf & _
-        "Worksheet functions: =NT_RESOLVE(A2)  =NT_PTR(A2)  =NT_PING(A2)" & vbCrLf & vbCrLf & _
+        "1. Select a column of IP addresses, hostnames or subnets" & vbCrLf & _
+        "   (select just the first cell to run to the end of the list)," & vbCrLf & _
+        "   or select an empty cell to type them in." & vbCrLf & _
+        "2. Click Check DNS, DNS Only, Ping Only, Traceroute or Subnet Calc." & vbCrLf & _
+        "3. Results go on a new sheet as a table - your data is never changed." & vbCrLf & _
+        "   Press Esc to stop a long run." & vbCrLf & vbCrLf & _
+        "A header row (e.g. 'Hostname' or 'IP Address') is detected and skipped." & vbCrLf & _
+        "Each traceroute gets its own sheet." & vbCrLf & vbCrLf & _
+        "Worksheet functions: =NT_RESOLVE(A2)  =NT_PTR(A2)  =NT_PING(A2)" & vbCrLf & _
+        "   =NT_SUBNET(A2, ""network"")  =NT_INSUBNET(B2, A2)" & vbCrLf & vbCrLf & _
         "Ping: " & PING_COUNT & " echo requests per host, " & PING_TIMEOUT_MS & " ms timeout each.", _
         vbInformation, "About " & APP_NAME
 End Sub
@@ -136,94 +200,70 @@ Public Sub NetTools_PingOnly()
     RunChecks False, True
 End Sub
 
+Public Sub NetTools_Traceroute()
+    RunTraceroute
+End Sub
+
+Public Sub NetTools_SubnetCalc()
+    RunSubnetCalc
+End Sub
+
 '==============================================================================
-' Main routine
+' Main routine: Check DNS / DNS Only / Ping Only
 '==============================================================================
 Private Sub RunChecks(ByVal doDns As Boolean, ByVal doPing As Boolean)
-    Dim ws As Worksheet
-    Dim col As Long, firstRow As Long, lastRow As Long, headerRow As Long
-    Dim headers As Variant, nOut As Long, outHeaderRow As Long
-    Dim r As Long, total As Long, done As Long
-    Dim host As String, res As HostResult, rowVals() As Variant
+    Dim items As Collection, srcDesc As String, ws As Worksheet, lo As ListObject
+    Dim headers As Variant, title As String, rowRng As Range
+    Dim i As Long, total As Long, done As Long, host As String, res As HostResult
     Dim nUp As Long, nDown As Long, nLoss As Long, nDnsFail As Long, nMismatch As Long
     Dim t0 As Double, wsaOk As Boolean, msg As String
 
-    If ActiveSheet Is Nothing Then Exit Sub
-    If TypeName(Selection) <> "Range" Then
-        MsgBox "Select the cells that hold the IP addresses or hostnames first.", vbExclamation, APP_NAME
-        Exit Sub
-    End If
-    Set ws = ActiveSheet
-    If ws.ProtectContents Then
-        MsgBox "This sheet is protected - unprotect it so NetTools can write results.", vbExclamation, APP_NAME
-        Exit Sub
-    End If
+    Set items = GetInputList("Hostnames or IP addresses to check, separated by commas or spaces:", False, srcDesc)
+    If items Is Nothing Then Exit Sub
+    total = items.Count
 
-    If Not GetInputRows(ws, Selection, col, firstRow, lastRow, headerRow) Then Exit Sub
-
+    If doDns And doPing Then
+        title = "DNS Check"
+    ElseIf doDns Then
+        title = "DNS Lookup"
+    Else
+        title = "Ping"
+    End If
     headers = BuildHeaders(doDns, doPing)
-    nOut = UBound(headers) - LBound(headers) + 1
-
-    ' Where the result headers go: the detected header row, else the row
-    ' above the data if that's empty, else nowhere.
-    If headerRow > 0 Then
-        outHeaderRow = headerRow
-    ElseIf firstRow > 1 Then
-        If Application.WorksheetFunction.CountA( _
-            ws.Range(ws.Cells(firstRow - 1, col), ws.Cells(firstRow - 1, col + nOut))) = 0 Then
-            outHeaderRow = firstRow - 1
-        End If
-    End If
-
-    If Not PrepareOutputArea(ws, col, nOut, IIf(outHeaderRow > 0, outHeaderRow, firstRow), lastRow, outHeaderRow) Then Exit Sub
-
-    total = Application.WorksheetFunction.CountA(ws.Range(ws.Cells(firstRow, col), ws.Cells(lastRow, col)))
-    If total = 0 Then
-        MsgBox "There are no hostnames or IP addresses in the selected cells.", vbExclamation, APP_NAME
-        Exit Sub
-    End If
-
-    ' Header cells
-    If outHeaderRow > 0 Then
-        With ws.Range(ws.Cells(outHeaderRow, col + 1), ws.Cells(outHeaderRow, col + nOut))
-            .Value = headers
-            .Font.Bold = True
-        End With
-    End If
-    ' Text columns stay text (stops Excel turning e.g. IPv6 or "1/2" into numbers/dates)
-    FormatOutputColumns ws, col, firstRow, lastRow, headers
 
     t0 = Timer
     Application.EnableCancelKey = xlErrorHandler
     On Error GoTo Handler
 
+    Set ws = NewResultSheet(title)
+    Set lo = StartResultTable(ws, title & "  -  " & srcDesc, headers, total)
+
     wsaOk = WsaInit()
-    If doDns And Not wsaOk Then
+    If Not wsaOk Then
         MsgBox "Could not start Windows networking (WSAStartup failed).", vbCritical, APP_NAME
         GoTo Cleanup
     End If
 
-    For r = firstRow To lastRow
-        host = CleanHost(ws.Cells(r, col).Value)
-        If Len(host) > 0 Then
-            done = done + 1
-            Application.StatusBar = APP_NAME & ": " & host & "  (" & done & " of " & total & ")   -   press Esc to stop"
+    For i = 1 To total
+        host = items(i)
+        Application.StatusBar = APP_NAME & ": " & host & "  (" & i & " of " & total & ")   -   press Esc to stop"
 
-            res = CheckHost(host, doDns, doPing)
-            rowVals = ResultToRow(res, doDns, doPing)
-            ws.Range(ws.Cells(r, col + 1), ws.Cells(r, col + nOut)).Value = rowVals
-            ColourRow ws, r, col, headers, res
+        res = CheckHost(host, doDns, doPing)
+        Set rowRng = lo.DataBodyRange.Rows(i)
+        rowRng.Value = ResultToRow(host, res, doDns, doPing)
+        ColourRow rowRng, headers, res
+        done = i
 
-            If res.DnsFailed Then nDnsFail = nDnsFail + 1
-            If doDns And Left$(res.Match, 2) = "No" Then nMismatch = nMismatch + 1
-            If doPing Then
-                If res.PingUp Then nUp = nUp + 1 Else nDown = nDown + 1
-                If res.PingLoss Then nLoss = nLoss + 1
-            End If
-            DoEvents
+        If res.DnsFailed Then nDnsFail = nDnsFail + 1
+        If doDns And Left$(res.Match, 2) = "No" Then nMismatch = nMismatch + 1
+        If doPing Then
+            If res.PingUp Then nUp = nUp + 1 Else nDown = nDown + 1
+            If res.PingLoss Then nLoss = nLoss + 1
         End If
-    Next r
+        DoEvents
+    Next i
 
+    FinishTable lo, done
     msg = "Checked " & done & " host(s) in " & Format$(ElapsedSeconds(t0), "0.0") & " s." & vbCrLf & vbCrLf
     If doDns Then
         msg = msg & "DNS lookup failed: " & nDnsFail & vbCrLf & _
@@ -234,19 +274,17 @@ Private Sub RunChecks(ByVal doDns As Boolean, ByVal doPing As Boolean)
                     "   ...with packet loss: " & nLoss & vbCrLf & _
                     "Ping down: " & nDown & vbCrLf
     End If
-    If outHeaderRow = 0 Then
-        msg = msg & vbCrLf & "Columns: " & Join(headers, " | ")
-    End If
+    msg = msg & vbCrLf & "Results are on the sheet """ & ws.Name & """."
     Application.StatusBar = False
     MsgBox msg, vbInformation, APP_NAME
     GoTo Cleanup
 
 Handler:
+    Application.StatusBar = False
     If Err.Number = 18 Then
-        Application.StatusBar = False
+        If Not lo Is Nothing Then FinishTable lo, done
         MsgBox "Stopped after " & done & " of " & total & " host(s).", vbInformation, APP_NAME
     Else
-        Application.StatusBar = False
         MsgBox "Error " & Err.Number & ": " & Err.Description, vbCritical, APP_NAME
     End If
 
@@ -257,7 +295,64 @@ Cleanup:
     Application.EnableCancelKey = xlInterrupt
 End Sub
 
-' Works out which column/rows to check from the selection.
+'==============================================================================
+' Input and result sheets
+'==============================================================================
+
+' What to check: the values in the selected column (header skipped), or - if
+' an empty cell is selected - whatever the user types in. raw=True keeps the
+' text as-is (subnets); otherwise each value is tidied into a host name.
+' Returns Nothing if there is nothing to do.
+Private Function GetInputList(ByVal prompt As String, ByVal raw As Boolean, ByRef srcDesc As String) As Collection
+    Dim items As New Collection, ws As Worksheet, typed As String, part As Variant, s As String
+    Dim col As Long, firstRow As Long, lastRow As Long, headerRow As Long, r As Long
+    Dim askUser As Boolean
+
+    askUser = True
+    If TypeName(Selection) = "Range" Then
+        If Not (Selection.Cells.CountLarge = 1 And Len(Trim$(Selection.Cells(1, 1).Text)) = 0) Then
+            askUser = False
+            Set ws = Selection.Worksheet
+            If Not GetInputRows(ws, Selection, col, firstRow, lastRow, headerRow) Then Exit Function
+            For r = firstRow To lastRow
+                s = CellInput(ws.Cells(r, col), raw)
+                If Len(s) > 0 Then items.Add s
+            Next r
+            srcDesc = "from " & ws.Name & "!" & _
+                      ws.Range(ws.Cells(firstRow, col), ws.Cells(lastRow, col)).Address(False, False)
+            If items.Count = 0 Then
+                MsgBox "The selected cells are empty.", vbExclamation, APP_NAME
+                Exit Function
+            End If
+        End If
+    End If
+
+    If askUser Then
+        typed = InputBox(prompt & vbCrLf & vbCrLf & _
+                         "(Or select a column of them first, then click the button.)", APP_NAME)
+        typed = Replace(Replace(Replace(typed, ";", ","), vbCr, ","), vbLf, ",")
+        If Not raw Then typed = Replace(typed, " ", ",")
+        For Each part In Split(typed, ",")
+            If raw Then s = Trim$(CStr(part)) Else s = CleanHost(part)
+            If Len(s) > 0 Then items.Add s
+        Next part
+        If items.Count = 0 Then Exit Function
+        srcDesc = "typed in"
+    End If
+
+    Set GetInputList = items
+End Function
+
+Private Function CellInput(ByVal cell As Range, ByVal raw As Boolean) As String
+    If IsError(cell.Value) Then Exit Function
+    If raw Then
+        CellInput = Trim$(Replace(Replace(cell.Text, vbTab, " "), Chr$(160), " "))
+    Else
+        CellInput = CleanHost(cell.Value)
+    End If
+End Function
+
+' Works out which column/rows to read from the selection.
 Private Function GetInputRows(ByVal ws As Worksheet, ByVal sel As Range, _
         ByRef col As Long, ByRef firstRow As Long, ByRef lastRow As Long, _
         ByRef headerRow As Long) As Boolean
@@ -282,17 +377,12 @@ Private Function GetInputRows(ByVal ws As Worksheet, ByVal sel As Range, _
         lastRow = rng.Row + rng.Rows.Count - 1
     End If
 
-    If col + 9 > ws.Columns.Count Then
-        MsgBox "There is no room to the right of this column for results.", vbExclamation, APP_NAME
-        Exit Function
-    End If
-
     If LooksLikeHeader(CStr(ws.Cells(firstRow, col).Text)) Then
         headerRow = firstRow
         firstRow = firstRow + 1
     End If
     If firstRow > lastRow Then
-        MsgBox "There are no hostnames or IP addresses below the header.", vbExclamation, APP_NAME
+        MsgBox "There is nothing below the header to check.", vbExclamation, APP_NAME
         Exit Function
     End If
     GetInputRows = True
@@ -301,124 +391,153 @@ End Function
 Private Function LooksLikeHeader(ByVal s As String) As Boolean
     s = LCase$(Trim$(s))
     If Len(s) = 0 Then Exit Function
-    If InStr(s, " ") > 0 Then LooksLikeHeader = True: Exit Function
+    If InStr(s, " ") > 0 And InStr(s, ".") = 0 Then LooksLikeHeader = True: Exit Function
     Select Case s
         Case "host", "hosts", "hostname", "hostnames", "host_name", "ip", "ips", "ipaddress", _
              "ip_address", "ip-address", "address", "addresses", "name", "names", "device", _
              "devices", "fqdn", "server", "servers", "target", "targets", "node", "nodes", _
-             "dns", "dnsname", "dns_name"
+             "dns", "dnsname", "dns_name", "subnet", "subnets", "cidr", "network", "networks", _
+             "prefix", "prefixes", "range", "ranges", "vlan", "vlans"
             LooksLikeHeader = True
+    End Select
+End Function
+
+' Adds a new sheet after the active one, named e.g. "DNS Check", "DNS Check 2".
+Private Function NewResultSheet(ByVal base As String) As Worksheet
+    Dim nm As String, n As Long, ch As Variant, wb As Workbook, ws As Worksheet
+    If ActiveWorkbook Is Nothing Then Workbooks.Add
+    Set wb = ActiveWorkbook
+    For Each ch In Array(":", "\", "/", "?", "*", "[", "]")
+        base = Replace(base, CStr(ch), "_")
+    Next ch
+    base = Left$(base, 27)
+    nm = base
+    n = 1
+    Do While SheetExists(wb, nm)
+        n = n + 1
+        nm = base & " " & n
+    Loop
+    If TypeName(ActiveSheet) = "Worksheet" Then
+        Set ws = wb.Worksheets.Add(After:=ActiveSheet)
+    Else
+        Set ws = wb.Worksheets.Add(After:=wb.Sheets(wb.Sheets.Count))
+    End If
+    ws.Name = nm
+    Set NewResultSheet = ws
+End Function
+
+Private Function SheetExists(ByVal wb As Workbook, ByVal nm As String) As Boolean
+    Dim sh As Object
+    On Error Resume Next
+    Set sh = wb.Sheets(nm)
+    SheetExists = Not sh Is Nothing
+End Function
+
+' Title in A1, run details in A2, then an Excel table (header row + nRows
+' empty rows) starting at row RESULT_HEADER_ROW.
+Private Function StartResultTable(ByVal ws As Worksheet, ByVal title As String, _
+        ByVal headers As Variant, ByVal nRows As Long) As ListObject
+    Dim nCols As Long, i As Long, lo As ListObject
+    nCols = UBound(headers) - LBound(headers) + 1
+    If nRows < 1 Then nRows = 1
+
+    WriteSheetTitle ws, title
+    For i = 0 To nCols - 1
+        With ws.Range(ws.Cells(RESULT_HEADER_ROW + 1, i + 1), ws.Cells(RESULT_HEADER_ROW + nRows, i + 1))
+            If IsNumericColumn(CStr(headers(LBound(headers) + i))) Then
+                .NumberFormat = "General"
+                .HorizontalAlignment = xlRight
+            Else
+                .NumberFormat = "@"   ' stops Excel turning IPv6, "3/4" etc. into numbers/dates
+            End If
+        End With
+    Next i
+    ws.Range(ws.Cells(RESULT_HEADER_ROW, 1), ws.Cells(RESULT_HEADER_ROW, nCols)).Value = headers
+
+    Set lo = ws.ListObjects.Add(xlSrcRange, _
+        ws.Range(ws.Cells(RESULT_HEADER_ROW, 1), ws.Cells(RESULT_HEADER_ROW + nRows, nCols)), , xlYes)
+    lo.TableStyle = RESULT_TABLE_STYLE
+    lo.Range.Columns.AutoFit
+    FreezeHeader ws
+    Set StartResultTable = lo
+End Function
+
+Private Sub WriteSheetTitle(ByVal ws As Worksheet, ByVal title As String)
+    With ws.Cells(1, 1)
+        .Value = title
+        .Font.Bold = True
+        .Font.Size = 13
+    End With
+    ws.Cells(2, 1).Value = "Run " & Format$(Now, "yyyy-mm-dd hh:nn:ss") & " on " & Environ$("COMPUTERNAME") & _
+                           " by " & APP_NAME & " " & APP_VERSION
+    ws.Cells(2, 1).Font.Color = RGB(89, 89, 89)
+End Sub
+
+' Keeps the title and table header visible while scrolling.
+Private Sub FreezeHeader(ByVal ws As Worksheet)
+    On Error Resume Next
+    ws.Activate
+    ActiveWindow.FreezePanes = False
+    ActiveWindow.ScrollRow = 1
+    ws.Cells(RESULT_HEADER_ROW + 1, 1).Select
+    ActiveWindow.FreezePanes = True
+End Sub
+
+' Trims unused rows (if the run was stopped early) and sizes the columns.
+Private Sub FinishTable(ByVal lo As ListObject, ByVal rowsUsed As Long)
+    Dim c As Range
+    On Error Resume Next
+    If rowsUsed < 1 Then rowsUsed = 1
+    If Not lo.DataBodyRange Is Nothing Then
+        If lo.DataBodyRange.Rows.Count > rowsUsed Then
+            lo.DataBodyRange.Rows(rowsUsed + 1).Resize(lo.DataBodyRange.Rows.Count - rowsUsed).Delete
+        End If
+    End If
+    lo.Range.Columns.AutoFit
+    For Each c In lo.Range.Columns
+        If c.ColumnWidth > 60 Then c.ColumnWidth = 60
+    Next c
+End Sub
+
+Private Function IsNumericColumn(ByVal header As String) As Boolean
+    Select Case header
+        Case H_LAT, H_TTL, S_HOSTS, S_TOTAL, "Hop"
+            IsNumericColumn = True
     End Select
 End Function
 
 Private Function BuildHeaders(ByVal doDns As Boolean, ByVal doPing As Boolean) As Variant
     If doDns And doPing Then
-        BuildHeaders = Array(H_TYPE, H_IPS, H_PTR, H_MATCH, H_PING, H_REPLIES, H_LAT, H_TTL)
+        BuildHeaders = Array(H_HOST, H_TYPE, H_IPS, H_PTR, H_MATCH, H_PING, H_REPLIES, H_LAT, H_TTL)
     ElseIf doDns Then
-        BuildHeaders = Array(H_TYPE, H_IPS, H_PTR, H_MATCH)
+        BuildHeaders = Array(H_HOST, H_TYPE, H_IPS, H_PTR, H_MATCH)
     Else
-        BuildHeaders = Array(H_PINGIP, H_PING, H_REPLIES, H_LAT, H_TTL)
+        BuildHeaders = Array(H_HOST, H_PINGIP, H_PING, H_REPLIES, H_LAT, H_TTL)
     End If
 End Function
 
-Private Function IsNetToolsHeader(ByVal s As String) As Boolean
-    Select Case s
-        Case H_TYPE, H_IPS, H_PTR, H_MATCH, H_PINGIP, H_PING, H_REPLIES, H_LAT, H_TTL
-            IsNetToolsHeader = True
-        Case "Latency (ms)"      ' header used by version 1.0.0
-            IsNetToolsHeader = True
-    End Select
-End Function
-
-' Makes sure results won't silently overwrite the user's data.
-' Re-running over earlier NetTools results just overwrites them.
-Private Function PrepareOutputArea(ByVal ws As Worksheet, ByVal col As Long, ByVal nOut As Long, _
-        ByVal topRow As Long, ByVal lastRow As Long, ByVal outHeaderRow As Long) As Boolean
-    Dim area As Range, c As Long, previousRun As Boolean, ans As VbMsgBoxResult, nOld As Long
-
-    ' Earlier NetTools run? (header row holds our headers)
-    If outHeaderRow > 0 Then
-        c = col + 1
-        Do While IsNetToolsHeader(CStr(ws.Cells(outHeaderRow, c).Value))
-            nOld = nOld + 1
-            c = c + 1
-        Loop
-        previousRun = (nOld > 0)
-    End If
-
-    If previousRun Then
-        ' Clear the old result block (it may be wider/narrower than this run)
-        With ws.Range(ws.Cells(outHeaderRow, col + 1), ws.Cells(lastRow, col + nOld))
-            .ClearContents
-            .ClearFormats
-        End With
-        If nOld >= nOut Then PrepareOutputArea = True: Exit Function
-        ' Need more columns than last time - check the extra ones are free
-        Set area = ws.Range(ws.Cells(topRow, col + nOld + 1), ws.Cells(lastRow, col + nOut))
-    Else
-        Set area = ws.Range(ws.Cells(topRow, col + 1), ws.Cells(lastRow, col + nOut))
-    End If
-
-    If Application.WorksheetFunction.CountA(area) = 0 Then
-        PrepareOutputArea = True
-        Exit Function
-    End If
-
-    ans = MsgBox("The " & nOut & " columns to the right of the selected column already contain data." & vbCrLf & vbCrLf & _
-                 "Yes  = insert new columns for the results (nothing is lost)" & vbCrLf & _
-                 "No   = overwrite those cells" & vbCrLf & _
-                 "Cancel = stop", vbYesNoCancel + vbQuestion, APP_NAME)
-    Select Case ans
-        Case vbYes
-            ws.Range(ws.Cells(1, col + 1), ws.Cells(1, col + nOut)).EntireColumn.Insert Shift:=xlToRight
-            PrepareOutputArea = True
-        Case vbNo
-            With ws.Range(ws.Cells(topRow, col + 1), ws.Cells(lastRow, col + nOut))
-                .ClearContents
-                .ClearFormats
-            End With
-            PrepareOutputArea = True
-        Case Else
-            PrepareOutputArea = False
-    End Select
-End Function
-
-Private Sub FormatOutputColumns(ByVal ws As Worksheet, ByVal col As Long, _
-        ByVal firstRow As Long, ByVal lastRow As Long, ByVal headers As Variant)
-    Dim i As Long, rng As Range
-    For i = LBound(headers) To UBound(headers)
-        Set rng = ws.Range(ws.Cells(firstRow, col + 1 + i), ws.Cells(lastRow, col + 1 + i))
-        Select Case headers(i)
-            Case H_LAT, H_TTL
-                rng.NumberFormat = "General"
-                rng.HorizontalAlignment = xlRight
-            Case Else
-                rng.NumberFormat = "@"
-        End Select
-    Next i
-End Sub
-
-Private Function ResultToRow(ByRef res As HostResult, ByVal doDns As Boolean, ByVal doPing As Boolean) As Variant()
+Private Function ResultToRow(ByVal host As String, ByRef res As HostResult, _
+        ByVal doDns As Boolean, ByVal doPing As Boolean) As Variant()
     Dim v() As Variant
     If doDns And doPing Then
-        ReDim v(0 To 7)
-        v(0) = res.InputType: v(1) = res.Addresses: v(2) = res.Ptr: v(3) = res.Match
-        v(4) = res.PingStatus: v(5) = res.Replies: v(6) = res.Latency: v(7) = res.Ttl
+        ReDim v(0 To 8)
+        v(0) = host: v(1) = res.InputType: v(2) = res.Addresses: v(3) = res.Ptr: v(4) = res.Match
+        v(5) = res.PingStatus: v(6) = res.Replies: v(7) = res.Latency: v(8) = res.Ttl
     ElseIf doDns Then
-        ReDim v(0 To 3)
-        v(0) = res.InputType: v(1) = res.Addresses: v(2) = res.Ptr: v(3) = res.Match
-    Else
         ReDim v(0 To 4)
-        v(0) = res.FirstAddr: v(1) = res.PingStatus: v(2) = res.Replies: v(3) = res.Latency: v(4) = res.Ttl
+        v(0) = host: v(1) = res.InputType: v(2) = res.Addresses: v(3) = res.Ptr: v(4) = res.Match
+    Else
+        ReDim v(0 To 5)
+        v(0) = host: v(1) = res.FirstAddr: v(2) = res.PingStatus: v(3) = res.Replies
+        v(4) = res.Latency: v(5) = res.Ttl
     End If
     ResultToRow = v
 End Function
 
-Private Sub ColourRow(ByVal ws As Worksheet, ByVal r As Long, ByVal col As Long, _
-        ByVal headers As Variant, ByRef res As HostResult)
+Private Sub ColourRow(ByVal rowRng As Range, ByVal headers As Variant, ByRef res As HostResult)
     Dim i As Long, cell As Range
     For i = LBound(headers) To UBound(headers)
-        Set cell = ws.Cells(r, col + 1 + i)
+        Set cell = rowRng.Cells(1, i - LBound(headers) + 1)
         Select Case headers(i)
             Case H_PING, H_REPLIES
                 If res.PingLoss Then
@@ -451,44 +570,6 @@ End Sub
 Private Sub Warn(ByVal c As Range)
     c.Interior.Color = RGB(255, 235, 156): c.Font.Color = RGB(156, 101, 0)
 End Sub
-
-'==============================================================================
-' Clear Results
-'==============================================================================
-Private Sub ClearResults()
-    Dim ws As Worksheet, col As Long, firstRow As Long, lastRow As Long, headerRow As Long
-    Dim c As Long, n As Long
-
-    If TypeName(Selection) <> "Range" Then Exit Sub
-    Set ws = ActiveSheet
-    If Not GetInputRows(ws, Selection, col, firstRow, lastRow, headerRow) Then Exit Sub
-
-    If headerRow = 0 And firstRow > 1 Then headerRow = firstRow - 1
-    If headerRow > 0 Then
-        c = col + 1
-        Do While IsNetToolsHeader(CStr(ws.Cells(headerRow, c).Value))
-            n = n + 1
-            c = c + 1
-        Loop
-    End If
-    If n = 0 Then
-        MsgBox "No NetTools results found next to the selected column." & vbCrLf & _
-               "(Select the column of hosts that you ran the check on.)", vbInformation, APP_NAME
-        Exit Sub
-    End If
-
-    If MsgBox("Clear " & n & " NetTools result column(s) to the right of column " & _
-              ColumnLetter(col) & "?", vbOKCancel + vbQuestion, APP_NAME) <> vbOK Then Exit Sub
-
-    With ws.Range(ws.Cells(headerRow, col + 1), ws.Cells(lastRow, col + n))
-        .ClearContents
-        .ClearFormats
-    End With
-End Sub
-
-Private Function ColumnLetter(ByVal col As Long) As String
-    ColumnLetter = Split(ActiveSheet.Cells(1, col).Address(True, False), "$")(0)
-End Function
 
 '==============================================================================
 ' Checking one host
@@ -784,6 +865,349 @@ Private Function ElapsedSeconds(ByVal t0 As Double) As Double
     ElapsedSeconds = t
 End Function
 
+
+'==============================================================================
+' Traceroute
+'==============================================================================
+Private Sub RunTraceroute()
+    Dim hosts As Collection, srcDesc As String
+    Dim item As Variant, hIcmp As LongPtr, wsaOk As Boolean
+
+    Set hosts = GetInputList("Traceroute to (hostname or IP address - several can be separated by commas):", _
+                             False, srcDesc)
+    If hosts Is Nothing Then Exit Sub
+    If hosts.Count > TRACE_MAX_HOSTS Then
+        MsgBox "Traceroute runs on up to " & TRACE_MAX_HOSTS & " hosts at a time - " & _
+               "select fewer.", vbExclamation, APP_NAME
+        Exit Sub
+    End If
+    If hosts.Count > 3 Then
+        If MsgBox("Run " & hosts.Count & " traceroutes? Each one gets its own sheet and can take " & _
+                  "up to a minute or two.", vbOKCancel + vbQuestion, APP_NAME) <> vbOK Then Exit Sub
+    End If
+    If ActiveWorkbook Is Nothing Then Workbooks.Add
+
+    Application.EnableCancelKey = xlErrorHandler
+    On Error GoTo Handler
+    wsaOk = WsaInit()
+    hIcmp = IcmpCreateFile()
+    If hIcmp = 0 Or hIcmp = -1 Then
+        MsgBox "Could not open the Windows ICMP service (IcmpCreateFile failed).", vbCritical, APP_NAME
+        GoTo Cleanup
+    End If
+
+    For Each item In hosts
+        TraceOne CStr(item), hIcmp
+    Next item
+    GoTo Cleanup
+
+Handler:
+    Application.StatusBar = False
+    If Err.Number = 18 Then
+        MsgBox "Traceroute stopped.", vbInformation, APP_NAME
+    Else
+        MsgBox "Error " & Err.Number & ": " & Err.Description, vbCritical, APP_NAME
+    End If
+
+Cleanup:
+    On Error Resume Next
+    If hIcmp <> 0 And hIcmp <> -1 Then IcmpCloseHandle hIcmp
+    If wsaOk Then WSACleanup
+    Application.StatusBar = False
+    Application.EnableCancelKey = xlInterrupt
+End Sub
+
+Private Sub TraceOne(ByVal host As String, ByVal hIcmp As LongPtr)
+    Dim ip As String, item As Variant, ws As Worksheet, dest As Long
+    Dim hop As Long, probe As Long, r As Long, firstRow As Long
+    Dim fromAddr As String, hopAddr As String, status As Long, rtt As Long
+    Dim gotReply As Boolean, reached As Boolean, failed As Boolean
+    Dim silent As Long, note As String, ptr As String, lo As ListObject
+
+    ' Resolve to IPv4 (IcmpSendEcho is IPv4 only)
+    ip = NumericAddress(host)
+    If Len(ip) = 0 Then
+        For Each item In LookupAddresses(host)
+            If InStr(CStr(item), ":") = 0 Then ip = CStr(item): Exit For
+        Next item
+    End If
+    If InStr(ip, ":") > 0 Then ip = ""
+    If Len(ip) = 0 Then
+        MsgBox host & ": could not resolve to an IPv4 address." & vbCrLf & _
+               "(Traceroute supports IPv4 only.)", vbExclamation, APP_NAME
+        Exit Sub
+    End If
+    dest = IPv4ToNetLong(ip)
+
+    Set ws = NewResultSheet("Trace " & host)
+    WriteSheetTitle ws, "Traceroute to " & host & _
+        IIf(StrComp(host, ip, vbTextCompare) <> 0, "  [" & ip & "]", "") & _
+        "  -  max " & TRACE_MAX_HOPS & " hops, " & TRACE_PROBES & " probes per hop, " & TRACE_TIMEOUT_MS & " ms timeout"
+    With ws
+        .Range("A4:G4").Value = Array("Hop", "Address", "Hostname", "Probe 1 (ms)", "Probe 2 (ms)", "Probe 3 (ms)", "Note")
+        .Range("B:C").NumberFormat = "@"
+        .Range("G:G").NumberFormat = "@"
+        .Range("D:F").HorizontalAlignment = xlRight
+        .Columns("A").ColumnWidth = 6
+        .Columns("B").ColumnWidth = 18
+        .Columns("C").ColumnWidth = 40
+        .Columns("D:F").ColumnWidth = 13
+        .Columns("G").ColumnWidth = 30
+    End With
+    Set lo = ws.ListObjects.Add(xlSrcRange, ws.Range("A4:G5"), , xlYes)
+    lo.TableStyle = RESULT_TABLE_STYLE
+    FreezeHeader ws
+
+    firstRow = 5
+    r = firstRow
+    For hop = 1 To TRACE_MAX_HOPS
+        Application.StatusBar = APP_NAME & ": traceroute to " & host & " - hop " & hop & "   -   press Esc to stop"
+        If r > lo.Range.Row + lo.Range.Rows.Count - 1 Then lo.Resize ws.Range(ws.Cells(4, 1), ws.Cells(r, 7))
+        ws.Cells(r, 1).Value = hop
+        hopAddr = "": note = "": gotReply = False
+
+        For probe = 1 To TRACE_PROBES
+            If SendProbe(hIcmp, dest, hop, fromAddr, status, rtt) Then
+                gotReply = True
+                If Len(hopAddr) = 0 Then hopAddr = fromAddr
+                If rtt < 1 Then ws.Cells(r, 3 + probe).Value = "<1" Else ws.Cells(r, 3 + probe).Value = rtt
+                If status = IP_SUCCESS Then
+                    reached = True
+                ElseIf status <> IP_TTL_EXPIRED_TRANSIT Then
+                    failed = True
+                    note = PingStatusText(status)
+                End If
+            Else
+                ws.Cells(r, 3 + probe).Value = "*"
+            End If
+            DoEvents
+        Next probe
+
+        If gotReply Then
+            silent = 0
+            ws.Cells(r, 2).Value = hopAddr
+            ptr = ReverseLookup(hopAddr)
+            ws.Cells(r, 3).Value = ptr
+        Else
+            silent = silent + 1
+            ws.Cells(r, 2).Value = "Request timed out"
+            ws.Cells(r, 2).Font.Color = RGB(128, 128, 128)
+        End If
+        If reached Then note = "Destination reached"
+        ws.Cells(r, 7).Value = note
+        If reached Then ws.Range(ws.Cells(r, 1), ws.Cells(r, 7)).Interior.Color = RGB(198, 239, 206)
+        If failed And Not reached Then ws.Range(ws.Cells(r, 1), ws.Cells(r, 7)).Interior.Color = RGB(255, 199, 206)
+        r = r + 1
+        DoEvents
+
+        If reached Or failed Then Exit For
+        If silent >= TRACE_GIVE_UP_AFTER Then
+            note = "Stopped: " & TRACE_GIVE_UP_AFTER & " hops in a row with no reply."
+            Exit For
+        End If
+    Next hop
+
+    r = r + 1
+    If reached Then
+        ws.Cells(r, 1).Value = "Trace complete: " & ip & " reached in " & (hop) & " hop(s)."
+    ElseIf failed Then
+        ws.Cells(r, 1).Value = "Trace ended: " & note & "."
+    ElseIf silent >= TRACE_GIVE_UP_AFTER Then
+        ws.Cells(r, 1).Value = note & " The destination or a firewall may be blocking ICMP."
+    Else
+        ws.Cells(r, 1).Value = "Destination not reached within " & TRACE_MAX_HOPS & " hops."
+    End If
+    ws.Cells(r, 1).Font.Bold = True
+    Application.StatusBar = False
+End Sub
+
+' One ICMP echo with the given TTL. True if anything answered (the
+' destination, or a router saying the TTL expired / destination unreachable).
+Private Function SendProbe(ByVal hIcmp As LongPtr, ByVal dest As Long, ByVal ttl As Long, _
+        ByRef fromAddr As String, ByRef status As Long, ByRef rtt As Long) As Boolean
+    Dim opt(0 To 15) As Byte          ' IP_OPTION_INFORMATION: first byte is the TTL
+    Dim payload(0 To 31) As Byte
+    Dim reply(0 To 1023) As Byte      ' ICMP_ECHO_REPLY: Address @0, Status @4, RoundTripTime @8
+    Dim i As Long, n As Long, pReply As LongPtr
+
+    opt(0) = CByte(ttl)
+    For i = 0 To 31
+        payload(i) = 97 + (i Mod 23)  ' "abcdefghijklmnopqrstuvw..." like Windows ping
+    Next i
+    pReply = VarPtr(reply(0))
+    n = IcmpSendEcho(hIcmp, dest, VarPtr(payload(0)), 32, VarPtr(opt(0)), pReply, 1024, TRACE_TIMEOUT_MS)
+
+    status = ReadLong(pReply + 4)
+    rtt = ReadLong(pReply + 8)
+    fromAddr = reply(0) & "." & reply(1) & "." & reply(2) & "." & reply(3)
+    ' Some Windows versions return 0 for "TTL expired" but still fill in the reply
+    SendProbe = (n > 0) Or (ReadLong(pReply) <> 0 And status <> IP_REQ_TIMED_OUT And status <> IP_SUCCESS)
+End Function
+
+' "10.1.2.3" -> IPAddr (network byte order, as IcmpSendEcho wants it)
+Private Function IPv4ToNetLong(ByVal ip As String) As Long
+    Dim parts() As String, b(0 To 3) As Byte, i As Long, v As Long
+    parts = Split(ip, ".")
+    For i = 0 To 3
+        b(i) = CByte(parts(i))
+    Next i
+    CopyMemory v, VarPtr(b(0)), 4
+    IPv4ToNetLong = v
+End Function
+
+'==============================================================================
+' Subnet calculator
+'==============================================================================
+Private Sub RunSubnetCalc()
+    Dim items As Collection, srcDesc As String, ws As Worksheet, lo As ListObject
+    Dim headers As Variant, i As Long, info As SubnetInfo, v() As Variant, nBad As Long
+    Dim rowRng As Range
+
+    Set items = GetInputList("Subnets to calculate, separated by commas, for example:" & vbCrLf & vbCrLf & _
+                             "10.1.4.0/22, 192.168.1.10 255.255.255.0, 172.16.0.0/12", True, srcDesc)
+    If items Is Nothing Then Exit Sub
+
+    headers = Array(S_INPUT, S_CIDR, S_NET, S_MASK, S_WILD, S_FIRST, S_LAST, S_BCAST, S_HOSTS, S_TOTAL)
+    On Error GoTo Handler
+    Set ws = NewResultSheet("Subnets")
+    Set lo = StartResultTable(ws, "Subnet Calculator  -  " & srcDesc, headers, items.Count)
+
+    For i = 1 To items.Count
+        info = ParseSubnet(items(i))
+        ReDim v(0 To UBound(headers))
+        v(0) = items(i)
+        If info.Ok Then
+            v(1) = IPv4ToString(info.Network) & "/" & info.Prefix
+            v(2) = IPv4ToString(info.Network)
+            v(3) = IPv4ToString(info.Mask)
+            v(4) = IPv4ToString(4294967295# - info.Mask)
+            v(5) = IPv4ToString(info.FirstHost)
+            v(6) = IPv4ToString(info.LastHost)
+            v(7) = IPv4ToString(info.Broadcast)
+            v(8) = info.Hosts
+            v(9) = info.Broadcast - info.Network + 1
+        Else
+            v(1) = info.ErrorText
+        End If
+        Set rowRng = lo.DataBodyRange.Rows(i)
+        rowRng.Value = v
+        If Not info.Ok Then
+            nBad = nBad + 1
+            Bad rowRng.Cells(1, 2)
+        End If
+    Next i
+    FinishTable lo, items.Count
+
+    If nBad > 0 Then
+        MsgBox items.Count - nBad & " subnet(s) calculated." & vbCrLf & nBad & _
+               " couldn't be read - see the red cells.", vbExclamation, APP_NAME
+    End If
+    Exit Sub
+
+Handler:
+    MsgBox "Error " & Err.Number & ": " & Err.Description, vbCritical, APP_NAME
+End Sub
+
+' Accepts "10.1.4.0/22", "10.1.4.7/255.255.252.0", "10.1.4.7 255.255.252.0".
+' The address may be any host in the subnet; the network is worked out from it.
+Private Function ParseSubnet(ByVal text As String) As SubnetInfo
+    Dim info As SubnetInfo, p As Long, ipPart As String, maskPart As String
+    Dim m As Double, block As Double
+
+    text = Trim$(Replace(Replace(text, vbTab, " "), Chr$(160), " "))
+    p = InStr(text, "/")
+    If p = 0 Then p = InStr(text, " ")
+    If p = 0 Then
+        info.ErrorText = "Add a prefix or mask, e.g. 10.1.4.0/22"
+        ParseSubnet = info
+        Exit Function
+    End If
+    ipPart = Trim$(Left$(text, p - 1))
+    maskPart = Trim$(Mid$(text, p + 1))
+
+    If Not ParseIPv4(ipPart, info.Address) Then
+        info.ErrorText = "Not an IPv4 address: " & ipPart
+        ParseSubnet = info
+        Exit Function
+    End If
+
+    If IsAllDigits(maskPart) And Len(maskPart) <= 2 Then
+        info.Prefix = CLng(maskPart)
+        If info.Prefix > 32 Then
+            info.ErrorText = "Prefix must be 0-32"
+            ParseSubnet = info
+            Exit Function
+        End If
+    ElseIf ParseIPv4(maskPart, m) Then
+        info.Prefix = MaskToPrefix(m)
+        If info.Prefix < 0 Then
+            info.ErrorText = "Not a valid subnet mask: " & maskPart
+            ParseSubnet = info
+            Exit Function
+        End If
+    Else
+        info.ErrorText = "Not a prefix or subnet mask: " & maskPart
+        ParseSubnet = info
+        Exit Function
+    End If
+
+    block = 2 ^ (32 - info.Prefix)
+    info.Mask = 4294967296# - block
+    info.Network = Int(info.Address / block) * block
+    info.Broadcast = info.Network + block - 1
+    Select Case info.Prefix
+        Case 32         ' single host
+            info.FirstHost = info.Network: info.LastHost = info.Network: info.Hosts = 1
+        Case 31         ' point-to-point link (RFC 3021): both addresses usable
+            info.FirstHost = info.Network: info.LastHost = info.Broadcast: info.Hosts = 2
+        Case Else
+            info.FirstHost = info.Network + 1: info.LastHost = info.Broadcast - 1: info.Hosts = block - 2
+    End Select
+    info.Ok = True
+    ParseSubnet = info
+End Function
+
+Private Function IsAllDigits(ByVal s As String) As Boolean
+    Dim i As Long
+    If Len(s) = 0 Then Exit Function
+    For i = 1 To Len(s)
+        If Mid$(s, i, 1) < "0" Or Mid$(s, i, 1) > "9" Then Exit Function
+    Next i
+    IsAllDigits = True
+End Function
+
+' "10.1.2.3" -> 167838211. False if it isn't a dotted-quad IPv4 address.
+Private Function ParseIPv4(ByVal s As String, ByRef value As Double) As Boolean
+    Dim parts() As String, i As Long, n As Long
+    parts = Split(Trim$(s), ".")
+    If UBound(parts) <> 3 Then Exit Function
+    value = 0
+    For i = 0 To 3
+        If Not IsAllDigits(parts(i)) Or Len(parts(i)) > 3 Then Exit Function
+        n = CLng(parts(i))
+        If n > 255 Then Exit Function
+        value = value * 256 + n
+    Next i
+    ParseIPv4 = True
+End Function
+
+Private Function IPv4ToString(ByVal v As Double) As String
+    Dim a As Double, b As Double, c As Double, d As Double
+    a = Int(v / 16777216#): v = v - a * 16777216#
+    b = Int(v / 65536#): v = v - b * 65536#
+    c = Int(v / 256#): d = v - c * 256#
+    IPv4ToString = a & "." & b & "." & c & "." & d
+End Function
+
+' 255.255.252.0 -> 22. -1 if the mask isn't contiguous.
+Private Function MaskToPrefix(ByVal m As Double) As Long
+    Dim n As Long
+    For n = 0 To 32
+        If 4294967296# - 2 ^ (32 - n) = m Then MaskToPrefix = n: Exit Function
+    Next n
+    MaskToPrefix = -1
+End Function
+
 '==============================================================================
 ' Worksheet functions
 '==============================================================================
@@ -840,4 +1264,38 @@ Public Function NT_PING(ByVal host As String) As String
     Else
         NT_PING = status
     End If
+End Function
+
+' =NT_SUBNET("10.1.4.7/22")              -> "10.1.4.0/22 (10.1.4.1 - 10.1.7.254, 1022 hosts)"
+' =NT_SUBNET("10.1.4.7/22", "network")   -> "10.1.4.0"
+' field: cidr, network, mask, wildcard, first, last, broadcast, hosts, range, prefix
+Public Function NT_SUBNET(ByVal subnet As String, Optional ByVal field As String = "") As Variant
+    Dim info As SubnetInfo
+    info = ParseSubnet(subnet)
+    If Not info.Ok Then NT_SUBNET = info.ErrorText: Exit Function
+    Select Case LCase$(Trim$(field))
+        Case "":                       NT_SUBNET = IPv4ToString(info.Network) & "/" & info.Prefix & _
+                                           " (" & IPv4ToString(info.FirstHost) & " - " & _
+                                           IPv4ToString(info.LastHost) & ", " & info.Hosts & " hosts)"
+        Case "cidr":                   NT_SUBNET = IPv4ToString(info.Network) & "/" & info.Prefix
+        Case "network", "net":         NT_SUBNET = IPv4ToString(info.Network)
+        Case "mask", "netmask":        NT_SUBNET = IPv4ToString(info.Mask)
+        Case "wildcard":               NT_SUBNET = IPv4ToString(4294967295# - info.Mask)
+        Case "first":                  NT_SUBNET = IPv4ToString(info.FirstHost)
+        Case "last":                   NT_SUBNET = IPv4ToString(info.LastHost)
+        Case "broadcast", "bcast":     NT_SUBNET = IPv4ToString(info.Broadcast)
+        Case "hosts", "usable":        NT_SUBNET = info.Hosts
+        Case "range":                  NT_SUBNET = IPv4ToString(info.FirstHost) & " - " & IPv4ToString(info.LastHost)
+        Case "prefix":                 NT_SUBNET = info.Prefix
+        Case Else:                     NT_SUBNET = "Unknown field: " & field
+    End Select
+End Function
+
+' =NT_INSUBNET("10.1.5.20", "10.1.4.0/22")  -> TRUE
+Public Function NT_INSUBNET(ByVal ip As String, ByVal subnet As String) As Variant
+    Dim info As SubnetInfo, v As Double
+    info = ParseSubnet(subnet)
+    If Not info.Ok Then NT_INSUBNET = info.ErrorText: Exit Function
+    If Not ParseIPv4(CleanHost(ip), v) Then NT_INSUBNET = "Not an IPv4 address: " & ip: Exit Function
+    NT_INSUBNET = (v >= info.Network And v <= info.Broadcast)
 End Function
