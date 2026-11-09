@@ -15,21 +15,21 @@
                   imageMso="HyperlinkInsert"
                   onAction="NT_OnCheckDns"
                   screentip="Check DNS"
-                  supertip="Select a column of IP addresses or hostnames, then click. For each one NetTools does a forward lookup, a reverse (PTR) lookup, checks they agree, and pings it. Results go on a new sheet as a table - your data is not changed. Press Esc to stop." />
+                  supertip="Select a column of IP addresses or hostnames, then click. For each one NetTools does a forward lookup, a reverse (PTR) lookup, checks they agree, and pings it. Results go on the 'DNS Check' sheet as a table (overwritten on each run) - your data is not changed. Press Esc to stop." />
           <button id="btnDnsOnly"
                   label="DNS Only"
                   size="normal"
                   imageMso="FindDialog"
                   onAction="NT_OnDnsOnly"
                   screentip="DNS Only"
-                  supertip="Forward and reverse lookup only - no ping. Results go on a new sheet." />
+                  supertip="Forward and reverse lookup only - no ping. Results go on the 'DNS Lookup' sheet." />
           <button id="btnPingOnly"
                   label="Ping Only"
                   size="normal"
                   imageMso="Refresh"
                   onAction="NT_OnPingOnly"
                   screentip="Ping Only"
-                  supertip="Ping each host 4 times and report status, replies, average latency and TTL on a new sheet." />
+                  supertip="Ping each host 4 times and report status, replies, average latency and TTL on the 'Ping' sheet." />
         </group>
 
         <group id="grpPath" label="Path">
@@ -39,7 +39,7 @@
                   imageMso="SmartArtInsert"
                   onAction="NT_OnTraceroute"
                   screentip="Traceroute"
-                  supertip="Hop-by-hop path to each selected host (3 probes per hop, like tracert). Each trace goes on its own new sheet. Select an empty cell to type a host instead." />
+                  supertip="Hop-by-hop path to each selected host (3 probes per hop, like tracert). Each trace goes on its own 'Trace host' sheet. Select an empty cell to type a host instead." />
         </group>
 
         <group id="grpSubnets" label="Subnets">
@@ -49,7 +49,7 @@
                   imageMso="CalculateNow"
                   onAction="NT_OnSubnetCalc"
                   screentip="Subnet Calculator"
-                  supertip="For each selected subnet (10.1.4.0/22 or 10.1.4.7 255.255.252.0): network, mask, wildcard, first/last usable, broadcast and host count, on a new sheet. Select an empty cell to type subnets instead." />
+                  supertip="For each selected subnet (10.1.4.0/22 or 10.1.4.7 255.255.252.0): network, mask, wildcard, first/last usable, broadcast and host count, on the 'Subnets' sheet. Select an empty cell to type subnets instead." />
         </group>
 
         <group id="grpTools" label="Help">

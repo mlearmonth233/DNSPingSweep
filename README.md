@@ -14,9 +14,11 @@ a **NetTools** tab to the ribbon:
 
 **Results always go on a new sheet as a formatted Excel table with headers.
 The cells you select are never changed or overwritten.** Each run adds its
-own sheet (`DNS Check`, `DNS Check 2`, `Ping`, `Subnets`, `Trace server1`,
-...) with a title, the time it ran, and a table you can sort and filter.
-Delete the sheet when you no longer need it.
+own sheet (`DNS Check`, `DNS Lookup`, `Ping`, `Subnets`, `Trace server1`)
+with a title, the time it ran, and a table you can sort and filter.
+Running the same button again **overwrites** its sheet with the new
+results. NetTools only overwrites sheets it created: if one of your own
+sheets already has that name, the results go on `Subnets 2` (etc.) instead.
 
 ## Using it
 
@@ -97,7 +99,7 @@ Also available in formulas, if you want results next to your own data:
 
 ### MSI (recommended)
 
-Double-click `NetTools-2.0.0.msi` and close Excel first if it's open. No admin
+Double-click `NetTools-2.1.0.msi` and close Excel first if it's open. No admin
 rights are needed. The installer puts `NetTools.xlam` in your Excel startup
 folder (`%APPDATA%\Microsoft\Excel\XLSTART`). Excel loads it every time it
 starts, and because that folder is one of Office's default trusted
@@ -105,7 +107,7 @@ locations, the macros run without a security prompt.
 
 - Uninstall: **Settings > Apps > NetTools for Excel**.
 - Upgrade: run a newer MSI. It replaces the old version.
-- Silent / Intune / SCCM: `msiexec /i NetTools-2.0.0.msi /qn`. This is a
+- Silent / Intune / SCCM: `msiexec /i NetTools-2.1.0.msi /qn`. This is a
   **per-user** MSI, so deploy it in the *user* context.
 
 If your company uses Group Policy to turn off trusted locations or block

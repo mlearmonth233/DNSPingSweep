@@ -33,7 +33,7 @@ Option Explicit
 Private Const PING_COUNT As Long = 4             ' echo requests per host (like Windows ping)
 Private Const PING_TIMEOUT_MS As Long = 1000     ' per echo request
 Private Const APP_NAME As String = "NetTools"
-Private Const APP_VERSION As String = "2.0.0"
+Private Const APP_VERSION As String = "2.1.0"
 
 ' ---- Result column headers ---------------------------------------------------
 Private Const H_HOST As String = "Host / IP"
@@ -177,7 +177,8 @@ Public Sub NT_OnAbout(control As IRibbonControl)
         "   (select just the first cell to run to the end of the list)," & vbCrLf & _
         "   or select an empty cell to type them in." & vbCrLf & _
         "2. Click Check DNS, DNS Only, Ping Only, Traceroute or Subnet Calc." & vbCrLf & _
-        "3. Results go on a new sheet as a table - your data is never changed." & vbCrLf & _
+        "3. Results go on their own sheet as a table (rerunning overwrites" & vbCrLf & _
+        "   that sheet) - the data you selected is never changed." & vbCrLf & _
         "   Press Esc to stop a long run." & vbCrLf & vbCrLf & _
         "A header row (e.g. 'Hostname' or 'IP Address') is detected and skipped." & vbCrLf & _
         "Each traceroute gets its own sheet." & vbCrLf & vbCrLf & _
@@ -402,9 +403,12 @@ Private Function LooksLikeHeader(ByVal s As String) As Boolean
     End Select
 End Function
 
-' Adds a new sheet after the active one, named e.g. "DNS Check", "DNS Check 2".
+' Returns the results sheet called base, e.g. "Subnets". If NetTools made
+' that sheet on an earlier run it is cleared and reused (overwritten). A
+' sheet of yours with the same name is never touched - then a new sheet
+' "Subnets 2" (etc.) is used instead.
 Private Function NewResultSheet(ByVal base As String) As Worksheet
-    Dim nm As String, n As Long, ch As Variant, wb As Workbook, ws As Worksheet
+    Dim nm As String, n As Long, ch As Variant, wb As Workbook, ws As Worksheet, lo As ListObject
     If ActiveWorkbook Is Nothing Then Workbooks.Add
     Set wb = ActiveWorkbook
     For Each ch In Array(":", "\", "/", "?", "*", "[", "]")
@@ -414,6 +418,16 @@ Private Function NewResultSheet(ByVal base As String) As Worksheet
     nm = base
     n = 1
     Do While SheetExists(wb, nm)
+        If IsNetToolsSheet(wb.Sheets(nm)) Then
+            ' Earlier NetTools results: overwrite them
+            Set ws = wb.Worksheets(nm)
+            For Each lo In ws.ListObjects
+                lo.Delete
+            Next lo
+            ws.Cells.Clear
+            Set NewResultSheet = ws
+            Exit Function
+        End If
         n = n + 1
         nm = base & " " & n
     Loop
@@ -424,6 +438,13 @@ Private Function NewResultSheet(ByVal base As String) As Worksheet
     End If
     ws.Name = nm
     Set NewResultSheet = ws
+End Function
+
+' NetTools result sheets carry "... by NetTools x.y.z" in A2 (see WriteSheetTitle).
+Private Function IsNetToolsSheet(ByVal sh As Object) As Boolean
+    On Error Resume Next
+    If TypeName(sh) <> "Worksheet" Then Exit Function
+    IsNetToolsSheet = (InStr(1, CStr(sh.Range("A2").Value), " by " & APP_NAME & " ", vbBinaryCompare) > 0)
 End Function
 
 Private Function SheetExists(ByVal wb As Workbook, ByVal nm As String) As Boolean
