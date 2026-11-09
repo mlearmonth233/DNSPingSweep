@@ -1,6 +1,6 @@
 # DNSPingSweep: NetTools for Excel
 
-DNS resolution, ping, traceroute and subnet tool. An Excel add-in that adds
+DNS resolution, ping, traceroute, subnet scan and subnet calculator tool. An Excel add-in that adds
 a **NetTools** tab to the ribbon:
 
 | Button | What it does |
@@ -9,12 +9,14 @@ a **NetTools** tab to the ribbon:
 | **DNS Only** | The lookups without the ping (faster) |
 | **Ping Only** | 4 pings per host: status, replies, average latency, TTL |
 | **Traceroute** | Hop-by-hop path to each host (3 probes per hop, like `tracert`) |
+| **Subnet Scan** | Pings every address in a subnet and looks up its reverse DNS (PTR) name |
 | **Subnet Calc** | Network, mask, wildcard, first/last usable, broadcast and host count for each subnet |
 | **About** | Short help |
 
 **Results always go on a new sheet as a formatted Excel table with headers.
 The cells you select are never changed or overwritten.** Each run adds its
-own sheet (`DNS Check`, `DNS Lookup`, `Ping`, `Subnets`, `Trace server1`)
+own sheet (`DNS Check`, `DNS Lookup`, `Ping`, `Subnets`, `Trace server1`,
+`Scan 10.1.4.0_24`)
 with a title, the time it ran, and a table you can sort and filter.
 Running the same button again **overwrites** its sheet with the new
 results. NetTools only overwrites sheets it created: if one of your own
@@ -61,6 +63,29 @@ answers is green. The trace stops at the destination, on an "unreachable"
 reply, after 30 hops, or after 5 hops in a row with no reply (often a
 firewall blocking ICMP). IPv4 only. Up to 20 hosts per run.
 
+### Subnet Scan results
+
+Type or select a subnet as `10.1.4.0/24` or `10.1.4.0 255.255.255.0` (any
+address inside it works too). NetTools pings every usable address once
+(500 ms timeout) and looks up its PTR record straight from DNS. Each
+subnet gets its own sheet, e.g. `Scan 10.1.4.0_24`, with a table of:
+
+| Column | Example |
+|---|---|
+| IP Address | `10.1.4.17` (green if it answered) |
+| Ping | `Up`, `No reply`, `Destination host unreachable` |
+| Latency (ms) | `2` |
+| TTL | `255` |
+| Reverse DNS (PTR) | `ap-floor2-03.corp.example.com` |
+| Fwd/Rev Match | `Yes` if the PTR name resolves back to this IP |
+
+A summary line above the table, and a pop-up at the end, give the count of
+addresses that are up and that have PTR records. Use the table's filter
+arrows to show only `Up` addresses or only ones with a PTR. Up to 4,096
+addresses (a /20) per subnet. NetTools asks before anything bigger than a
+/24. A /24 where nothing answers takes about 2 minutes. Esc stops the scan
+and keeps what's been scanned so far.
+
 ### Subnet Calc results
 
 Accepts `10.1.4.0/22`, `10.1.4.7/22` (any address in the subnet),
@@ -99,7 +124,7 @@ Also available in formulas, if you want results next to your own data:
 
 ### MSI (recommended)
 
-Double-click `NetTools-2.1.0.msi` and close Excel first if it's open. No admin
+Double-click `NetTools-2.2.0.msi` and close Excel first if it's open. No admin
 rights are needed. The installer puts `NetTools.xlam` in your Excel startup
 folder (`%APPDATA%\Microsoft\Excel\XLSTART`). Excel loads it every time it
 starts, and because that folder is one of Office's default trusted
@@ -107,7 +132,7 @@ locations, the macros run without a security prompt.
 
 - Uninstall: **Settings > Apps > NetTools for Excel**.
 - Upgrade: run a newer MSI. It replaces the old version.
-- Silent / Intune / SCCM: `msiexec /i NetTools-2.1.0.msi /qn`. This is a
+- Silent / Intune / SCCM: `msiexec /i NetTools-2.2.0.msi /qn`. This is a
   **per-user** MSI, so deploy it in the *user* context.
 
 If your company uses Group Policy to turn off trusted locations or block
@@ -148,7 +173,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -Msi     # + dist\NetTools-
 
 | File | Purpose |
 |---|---|
-| `src/NetTools.bas` | All the VBA: ribbon callbacks, DNS (ws2_32), ping (WMI), traceroute (ICMP API), subnet maths, worksheet functions |
+| `src/NetTools.bas` | All the VBA: ribbon callbacks, DNS (ws2_32), ping (WMI), traceroute + subnet scan (ICMP API, DnsQuery), subnet maths, worksheet functions |
 | `src/customUI.xml` | Ribbon tab definition |
 | `installer/NetTools.wxs` | WiX source for the per-user MSI |
 | `build.ps1` | Builds the `.xlam` and, with `-Msi`, the MSI |

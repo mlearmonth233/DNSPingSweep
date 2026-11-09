@@ -43,6 +43,13 @@
         </group>
 
         <group id="grpSubnets" label="Subnets">
+          <button id="btnSubnetScan"
+                  label="Subnet Scan"
+                  size="large"
+                  imageMso="RefreshAll"
+                  onAction="NT_OnSubnetScan"
+                  screentip="Subnet Scan"
+                  supertip="Pings every address in a subnet (10.1.4.0/24 or 10.1.4.0 255.255.255.0) and looks up its reverse DNS name, checking it resolves back. Each subnet goes on its own 'Scan' sheet, overwritten when you scan it again. Select an empty cell to type the subnet." />
           <button id="btnSubnetCalc"
                   label="Subnet Calc"
                   size="large"
