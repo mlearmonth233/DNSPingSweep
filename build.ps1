@@ -22,19 +22,24 @@
 [CmdletBinding()]
 param(
     [switch]$Msi,
-    [string]$Version = (Get-Content (Join-Path $PSScriptRoot 'VERSION') -Raw).Trim()
+    [string]$Version
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Windows PowerShell 5.1 leaves $PSScriptRoot empty inside param() defaults,
+# so work out the script folder here instead.
+$root = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $Version) { $Version = (Get-Content (Join-Path $root 'VERSION') -Raw).Trim() }
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-$srcDir   = Join-Path $PSScriptRoot 'src'
-$distDir  = Join-Path $PSScriptRoot 'dist'
+$srcDir   = Join-Path $root 'src'
+$distDir  = Join-Path $root 'dist'
 $basFile  = Join-Path $srcDir 'NetTools.bas'
 $uiFile   = Join-Path $srcDir 'customUI.xml'
 $xlamFile = Join-Path $distDir 'NetTools.xlam'
-$wxsFile  = Join-Path $PSScriptRoot 'installer\NetTools.wxs'
+$wxsFile  = Join-Path $root 'installer\NetTools.wxs'
 $msiFile  = Join-Path $distDir "NetTools-$Version.msi"
 $wixVersion = '5.0.2'
 
