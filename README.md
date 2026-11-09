@@ -6,7 +6,7 @@ DNS resolution and ping tool. An Excel add-in that adds a **NetTools** tab to th
 |---|---|
 | **Check DNS** | For every IP address or hostname in the selected column: forward lookup, reverse (PTR) lookup, a forward/reverse match check, and a ping |
 | **DNS Only** | The lookups without the ping (faster) |
-| **Ping Only** | Ping status, latency and TTL |
+| **Ping Only** | Ping status, replies, average latency and TTL |
 | **Clear Results** | Removes the NetTools result columns next to the selected column |
 | **About** | Short help |
 
@@ -28,11 +28,13 @@ Results for **Check DNS**:
 | Resolved IP(s) | `10.1.2.3, fe80::1` (IPv4 first) or `(not found)` |
 | Reverse DNS (PTR) | `sw-core-01.corp.example.com` or `(no PTR record)` |
 | Fwd/Rev Match | `Yes`, `No PTR`, or `No - ...` with the reason |
-| Ping | `Up`, `Timed out`, `Destination host unreachable`, ... |
-| Latency (ms) | `3` |
+| Ping | `Up`, `Up - packet loss`, `Timed out`, `Destination host unreachable`, ... |
+| Replies | `4/4` |
+| Avg Latency (ms) | `3` |
 | TTL | `254` |
 
-Ping and match cells are coloured green, red or yellow.
+Each host gets 4 pings, like Windows `ping`. Ping and match cells are
+coloured green (all good), yellow (packet loss / mismatch) or red (down / not found).
 
 **Fwd/Rev Match** means:
 - for a **hostname**: the PTR record of its first address is the same name
@@ -41,23 +43,24 @@ Ping and match cells are coloured green, red or yellow.
 
 Lookups go through the Windows resolver, so the answers match what the PC
 itself sees (DNS suffixes, hosts file and so on). Ping uses WMI, so no
-command windows pop up. Each ping waits up to 1 second
-(`PING_TIMEOUT_MS` in `src/NetTools.bas`), and hosts are checked one at a
-time, so a list of hosts that are down takes about a second each.
+command windows pop up. Each host gets 4 pings (`PING_COUNT`), and each
+ping waits up to 1 second (`PING_TIMEOUT_MS`), both set at the top of
+`src/NetTools.bas`. Hosts are checked one at a time, so a host that is up
+takes a fraction of a second, and a host that is down takes about 4 seconds.
 
 It also adds worksheet functions you can use in formulas:
 
 ```
 =NT_RESOLVE(A2)    10.1.2.3
 =NT_PTR(A2)        server1.corp.example.com
-=NT_PING(A2)       Up (3 ms)
+=NT_PING(A2)       Up (4/4, 3 ms)
 ```
 
 ## Install
 
 ### MSI (recommended)
 
-Double-click `NetTools-1.0.0.msi` and close Excel first if it's open. No admin
+Double-click `NetTools-1.1.0.msi` and close Excel first if it's open. No admin
 rights are needed. The installer puts `NetTools.xlam` in your Excel startup
 folder (`%APPDATA%\Microsoft\Excel\XLSTART`). Excel loads it every time it
 starts, and because that folder is one of Office's default trusted
@@ -65,7 +68,7 @@ locations, the macros run without a security prompt.
 
 - Uninstall: **Settings > Apps > NetTools for Excel**.
 - Upgrade: run a newer MSI. It replaces the old version.
-- Silent / Intune / SCCM: `msiexec /i NetTools-1.0.0.msi /qn`. This is a
+- Silent / Intune / SCCM: `msiexec /i NetTools-1.1.0.msi /qn`. This is a
   **per-user** MSI, so deploy it in the *user* context.
 
 If your company uses Group Policy to turn off trusted locations or block

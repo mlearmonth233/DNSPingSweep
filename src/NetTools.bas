@@ -14,16 +14,17 @@ Attribute VB_Name = "NetTools"
 ' Worksheet functions are included too:
 '   =NT_RESOLVE(A2)   -> IP address(es) for a hostname
 '   =NT_PTR(A2)       -> reverse DNS name for an IP (or a hostname's IP)
-'   =NT_PING(A2)      -> "Up (12 ms)" / "Timed out" / ...
+'   =NT_PING(A2)      -> "Up (4/4, 12 ms)" / "Timed out" / ...
 '
 ' Requires Excel 2010 or later (VBA7), 32- or 64-bit, on Windows.
 '==============================================================================
 Option Explicit
 
 ' ---- Settings ----------------------------------------------------------------
-Private Const PING_TIMEOUT_MS As Long = 1000     ' per host
+Private Const PING_COUNT As Long = 4             ' echo requests per host (like Windows ping)
+Private Const PING_TIMEOUT_MS As Long = 1000     ' per echo request
 Private Const APP_NAME As String = "NetTools"
-Private Const APP_VERSION As String = "1.0.0"
+Private Const APP_VERSION As String = "1.1.0"
 
 ' ---- Result column headers ---------------------------------------------------
 Private Const H_TYPE As String = "Input Type"
@@ -32,7 +33,8 @@ Private Const H_PTR As String = "Reverse DNS (PTR)"
 Private Const H_MATCH As String = "Fwd/Rev Match"
 Private Const H_PINGIP As String = "Pinged Address"
 Private Const H_PING As String = "Ping"
-Private Const H_LAT As String = "Latency (ms)"
+Private Const H_REPLIES As String = "Replies"
+Private Const H_LAT As String = "Avg Latency (ms)"
 Private Const H_TTL As String = "TTL"
 
 ' ---- Winsock -----------------------------------------------------------------
@@ -82,10 +84,12 @@ Private Type HostResult
     Ptr As String
     Match As String
     PingStatus As String
+    Replies As String       ' e.g. "3/4"
     Latency As Variant
     Ttl As Variant
     DnsFailed As Boolean
-    PingUp As Boolean
+    PingUp As Boolean       ' at least one reply
+    PingLoss As Boolean     ' some, but not all, replies lost
 End Type
 
 '==============================================================================
@@ -115,7 +119,7 @@ Public Sub NT_OnAbout(control As IRibbonControl)
         "3. Results appear in the columns to the right. Press Esc to stop." & vbCrLf & vbCrLf & _
         "A header row (e.g. 'Hostname' or 'IP Address') is detected and skipped." & vbCrLf & vbCrLf & _
         "Worksheet functions: =NT_RESOLVE(A2)  =NT_PTR(A2)  =NT_PING(A2)" & vbCrLf & vbCrLf & _
-        "Ping timeout: " & PING_TIMEOUT_MS & " ms per host.", _
+        "Ping: " & PING_COUNT & " echo requests per host, " & PING_TIMEOUT_MS & " ms timeout each.", _
         vbInformation, "About " & APP_NAME
 End Sub
 
@@ -141,7 +145,7 @@ Private Sub RunChecks(ByVal doDns As Boolean, ByVal doPing As Boolean)
     Dim headers As Variant, nOut As Long, outHeaderRow As Long
     Dim r As Long, total As Long, done As Long
     Dim host As String, res As HostResult, rowVals() As Variant
-    Dim nUp As Long, nDown As Long, nDnsFail As Long, nMismatch As Long
+    Dim nUp As Long, nDown As Long, nLoss As Long, nDnsFail As Long, nMismatch As Long
     Dim t0 As Double, wsaOk As Boolean, msg As String
 
     If ActiveSheet Is Nothing Then Exit Sub
@@ -214,6 +218,7 @@ Private Sub RunChecks(ByVal doDns As Boolean, ByVal doPing As Boolean)
             If doDns And Left$(res.Match, 2) = "No" Then nMismatch = nMismatch + 1
             If doPing Then
                 If res.PingUp Then nUp = nUp + 1 Else nDown = nDown + 1
+                If res.PingLoss Then nLoss = nLoss + 1
             End If
             DoEvents
         End If
@@ -225,7 +230,9 @@ Private Sub RunChecks(ByVal doDns As Boolean, ByVal doPing As Boolean)
                     "Forward/reverse mismatch or no PTR: " & nMismatch & vbCrLf
     End If
     If doPing Then
-        msg = msg & "Ping up: " & nUp & vbCrLf & "Ping down: " & nDown & vbCrLf
+        msg = msg & "Ping up: " & nUp & vbCrLf & _
+                    "   ...with packet loss: " & nLoss & vbCrLf & _
+                    "Ping down: " & nDown & vbCrLf
     End If
     If outHeaderRow = 0 Then
         msg = msg & vbCrLf & "Columns: " & Join(headers, " | ")
@@ -275,7 +282,7 @@ Private Function GetInputRows(ByVal ws As Worksheet, ByVal sel As Range, _
         lastRow = rng.Row + rng.Rows.Count - 1
     End If
 
-    If col + 8 > ws.Columns.Count Then
+    If col + 9 > ws.Columns.Count Then
         MsgBox "There is no room to the right of this column for results.", vbExclamation, APP_NAME
         Exit Function
     End If
@@ -306,17 +313,19 @@ End Function
 
 Private Function BuildHeaders(ByVal doDns As Boolean, ByVal doPing As Boolean) As Variant
     If doDns And doPing Then
-        BuildHeaders = Array(H_TYPE, H_IPS, H_PTR, H_MATCH, H_PING, H_LAT, H_TTL)
+        BuildHeaders = Array(H_TYPE, H_IPS, H_PTR, H_MATCH, H_PING, H_REPLIES, H_LAT, H_TTL)
     ElseIf doDns Then
         BuildHeaders = Array(H_TYPE, H_IPS, H_PTR, H_MATCH)
     Else
-        BuildHeaders = Array(H_PINGIP, H_PING, H_LAT, H_TTL)
+        BuildHeaders = Array(H_PINGIP, H_PING, H_REPLIES, H_LAT, H_TTL)
     End If
 End Function
 
 Private Function IsNetToolsHeader(ByVal s As String) As Boolean
     Select Case s
-        Case H_TYPE, H_IPS, H_PTR, H_MATCH, H_PINGIP, H_PING, H_LAT, H_TTL
+        Case H_TYPE, H_IPS, H_PTR, H_MATCH, H_PINGIP, H_PING, H_REPLIES, H_LAT, H_TTL
+            IsNetToolsHeader = True
+        Case "Latency (ms)"      ' header used by version 1.0.0
             IsNetToolsHeader = True
     End Select
 End Function
@@ -392,15 +401,15 @@ End Sub
 Private Function ResultToRow(ByRef res As HostResult, ByVal doDns As Boolean, ByVal doPing As Boolean) As Variant()
     Dim v() As Variant
     If doDns And doPing Then
-        ReDim v(0 To 6)
+        ReDim v(0 To 7)
         v(0) = res.InputType: v(1) = res.Addresses: v(2) = res.Ptr: v(3) = res.Match
-        v(4) = res.PingStatus: v(5) = res.Latency: v(6) = res.Ttl
+        v(4) = res.PingStatus: v(5) = res.Replies: v(6) = res.Latency: v(7) = res.Ttl
     ElseIf doDns Then
         ReDim v(0 To 3)
         v(0) = res.InputType: v(1) = res.Addresses: v(2) = res.Ptr: v(3) = res.Match
     Else
-        ReDim v(0 To 3)
-        v(0) = res.FirstAddr: v(1) = res.PingStatus: v(2) = res.Latency: v(3) = res.Ttl
+        ReDim v(0 To 4)
+        v(0) = res.FirstAddr: v(1) = res.PingStatus: v(2) = res.Replies: v(3) = res.Latency: v(4) = res.Ttl
     End If
     ResultToRow = v
 End Function
@@ -411,8 +420,14 @@ Private Sub ColourRow(ByVal ws As Worksheet, ByVal r As Long, ByVal col As Long,
     For i = LBound(headers) To UBound(headers)
         Set cell = ws.Cells(r, col + 1 + i)
         Select Case headers(i)
-            Case H_PING
-                If res.PingUp Then Good cell Else Bad cell
+            Case H_PING, H_REPLIES
+                If res.PingLoss Then
+                    Warn cell
+                ElseIf res.PingUp Then
+                    Good cell
+                Else
+                    Bad cell
+                End If
             Case H_MATCH
                 If res.Match = "Yes" Then
                     Good cell
@@ -480,7 +495,7 @@ End Function
 '==============================================================================
 Private Function CheckHost(ByVal host As String, ByVal doDns As Boolean, ByVal doPing As Boolean) As HostResult
     Dim res As HostResult, addrs As Collection, fwd As Collection, canonical As String
-    Dim lat As Variant, ttl As Variant
+    Dim lat As Variant, ttl As Variant, received As Long
 
     res.Latency = Empty
     res.Ttl = Empty
@@ -538,8 +553,10 @@ Private Function CheckHost(ByVal host As String, ByVal doDns As Boolean, ByVal d
     End If
 
     If doPing Then
-        res.PingStatus = PingHost(res.FirstAddr, lat, ttl)
-        res.PingUp = (res.PingStatus = "Up")
+        res.PingStatus = PingHost(res.FirstAddr, lat, ttl, received)
+        res.Replies = received & "/" & PING_COUNT
+        res.PingUp = (received > 0)
+        res.PingLoss = (received > 0 And received < PING_COUNT)
         res.Latency = lat
         res.Ttl = ttl
     End If
@@ -694,32 +711,49 @@ End Function
 '==============================================================================
 ' Ping (WMI Win32_PingStatus)
 '==============================================================================
-Private Function PingHost(ByVal addr As String, ByRef latency As Variant, ByRef ttl As Variant) As String
-    Dim replies As Object, reply As Object, code As Variant
+' Sends PING_COUNT echo requests (one at a time, like Windows ping).
+' Returns "Up", "Up - packet loss", or the failure (e.g. "Timed out").
+' latency = average round trip of the replies (ms), ttl = TTL of the last reply,
+' received = number of replies.
+Private Function PingHost(ByVal addr As String, ByRef latency As Variant, ByRef ttl As Variant, _
+        ByRef received As Long) As String
+    Dim pings As Object, reply As Object, code As Variant
+    Dim i As Long, totalMs As Double, lastFailure As String
     latency = Empty
     ttl = Empty
+    received = 0
+    lastFailure = "No response"
     On Error GoTo Fail
 
     If mWmi Is Nothing Then
         Set mWmi = GetObject("winmgmts:{impersonationLevel=impersonate}!\\.\root\cimv2")
     End If
-    Set replies = mWmi.ExecQuery( _
-        "SELECT StatusCode, ResponseTime, ResponseTimeToLive FROM Win32_PingStatus " & _
-        "WHERE Address='" & Replace(addr, "'", "") & "' AND Timeout=" & PING_TIMEOUT_MS)
 
-    PingHost = "No response"
-    For Each reply In replies
-        code = reply.StatusCode
-        If IsNull(code) Then
-            PingHost = "No response"
-        ElseIf CLng(code) = 0 Then
-            PingHost = "Up"
-            latency = reply.ResponseTime
-            If Not IsNull(reply.ResponseTimeToLive) Then ttl = reply.ResponseTimeToLive
-        Else
-            PingHost = PingStatusText(CLng(code))
-        End If
-    Next reply
+    For i = 1 To PING_COUNT
+        Set pings = mWmi.ExecQuery( _
+            "SELECT StatusCode, ResponseTime, ResponseTimeToLive FROM Win32_PingStatus " & _
+            "WHERE Address='" & Replace(addr, "'", "") & "' AND Timeout=" & PING_TIMEOUT_MS)
+        For Each reply In pings
+            code = reply.StatusCode
+            If IsNull(code) Then
+                lastFailure = "No response"
+            ElseIf CLng(code) = 0 Then
+                received = received + 1
+                If Not IsNull(reply.ResponseTime) Then totalMs = totalMs + reply.ResponseTime
+                If Not IsNull(reply.ResponseTimeToLive) Then ttl = reply.ResponseTimeToLive
+            Else
+                lastFailure = PingStatusText(CLng(code))
+            End If
+        Next reply
+        DoEvents        ' keeps Excel responsive and lets Esc stop the run
+    Next i
+
+    If received = 0 Then
+        PingHost = lastFailure
+    Else
+        latency = Round(totalMs / received, 0)
+        If received = PING_COUNT Then PingHost = "Up" Else PingHost = "Up - packet loss"
+    End If
     Exit Function
 
 Fail:
@@ -786,9 +820,10 @@ Public Function NT_PTR(ByVal hostOrIp As String) As String
     WSACleanup
 End Function
 
-' =NT_PING("server1")  ->  "Up (3 ms)" / "Timed out" / "Not resolved"
+' =NT_PING("server1")  ->  "Up (4/4, 3 ms)" / "Timed out" / "Not resolved"
 Public Function NT_PING(ByVal host As String) As String
     Dim ip As String, addrs As Collection, lat As Variant, ttl As Variant, status As String
+    Dim received As Long
     host = CleanHost(host)
     If Len(host) = 0 Then Exit Function
     If Not WsaInit() Then NT_PING = "#WSA error": Exit Function
@@ -799,6 +834,10 @@ Public Function NT_PING(ByVal host As String) As String
     End If
     WSACleanup
     If Len(ip) = 0 Then NT_PING = "Not resolved": Exit Function
-    status = PingHost(ip, lat, ttl)
-    If status = "Up" Then NT_PING = "Up (" & lat & " ms)" Else NT_PING = status
+    status = PingHost(ip, lat, ttl, received)
+    If received > 0 Then
+        NT_PING = status & " (" & received & "/" & PING_COUNT & ", " & lat & " ms)"
+    Else
+        NT_PING = status
+    End If
 End Function
