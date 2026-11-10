@@ -41,7 +41,7 @@ Private Const PING_COUNT As Long = 4             ' echo requests per host (like 
 Private Const PING_TIMEOUT_MS As Long = 1000     ' per echo request
 Private Const PING_DEAD_AFTER As Long = 2        ' stop pinging a host after this many misses in a row
 Private Const APP_NAME As String = "NetTools"
-Private Const APP_VERSION As String = "3.3.2"
+Private Const APP_VERSION As String = "3.4.0"
 
 ' ---- Result column headers ---------------------------------------------------
 Private Const H_HOST As String = "Host / IP"
@@ -231,10 +231,13 @@ Private Declare PtrSafe Function OpenProcess Lib "kernel32" (ByVal dwDesiredAcce
 Private Declare PtrSafe Function WaitForSingleObject Lib "kernel32" (ByVal hHandle As LongPtr, _
     ByVal dwMilliseconds As Long) As Long
 Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+Private Declare PtrSafe Function GetExitCodeProcess Lib "kernel32" (ByVal hProcess As LongPtr, _
+    ByRef lpExitCode As Long) As Long
 
 Private mWmi As Object
 Private mOui As Object          ' MAC vendor list (OUI -> vendor), loaded on first use
 Private mOuiTried As Boolean
+Private mSshScrub As String     ' AireOS run only: password to mask in anything written out
 
 ' One device in an SSH Logs run
 Private Type SshJob
@@ -248,6 +251,10 @@ Private Type SshJob
     Output As String
     SavedPath As String
     Ok As Boolean
+    Detail As String        ' short reason for the summary sheet
+    ErrText As String       ' everything plink printed on stderr (both stages)
+    Timeline As String      ' what happened when, for the run log
+    ExitCode As Long
 End Type
 
 ' Result of parsing/calculating one IPv4 subnet (addresses as 0..2^32-1)
@@ -2622,7 +2629,7 @@ Private Sub RunSshLogs()
     Dim items As Collection, srcDesc As String, plink As String, user As String, pw As String
     Dim cmds As String, jobs() As SshJob, n As Long, i As Long, running As Long, nDone As Long
     Dim tmpDir As String, logDir As String, cmdFile As String, pwFile As String, part As Variant, f As Integer
-    Dim nOk As Long, t0 As Double, summary As String, devType As Long, defCmds As String
+    Dim nOk As Long, t0 As Double, summary As String, devType As Long, defCmds As String, runLog As String
 
     plink = FindPlink()
     If Len(plink) = 0 Then
@@ -2694,6 +2701,7 @@ Private Sub RunSshLogs()
         Print #f, "exit"
     End If
     Close #f
+    If devType = SSH_AIREOS Then mSshScrub = pw      ' to mask it if the device echoes it back
     pw = ""
 
     For i = 1 To n
@@ -2701,6 +2709,8 @@ Private Sub RunSshLogs()
         jobs(i).BaseName = tmpDir & "\job" & i
         If Not IsSafeToken(jobs(i).Host, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_:") Then
             jobs(i).Status = "Not a valid host name"
+            jobs(i).Detail = "Only letters, digits, '.', '-', '_' and ':' are allowed in a device name."
+            SshNote jobs(i), "Skipped: not a valid host name"
             jobs(i).Stage = 3
         End If
     Next i
@@ -2717,8 +2727,7 @@ Private Sub RunSshLogs()
                         If jobs(i).Stage <> 3 Then running = running + 1
                     ElseIf ElapsedSeconds(jobs(i).Started) > IIf(jobs(i).Stage = 1, SSH_CONNECT_TIMEOUT_S, SSH_TIMEOUT_S) Then
                         SshKill jobs(i)
-                        jobs(i).Status = "Timed out after " & IIf(jobs(i).Stage = 1, SSH_CONNECT_TIMEOUT_S, SSH_TIMEOUT_S) & " s"
-                        jobs(i).Stage = 3
+                        SshTimedOut jobs(i)
                     Else
                         running = running + 1
                     End If
@@ -2751,14 +2760,17 @@ Private Sub RunSshLogs()
 
     ' Results: a summary sheet, then one sheet per device that answered
     Application.StatusBar = APP_NAME & ": writing SSH results"
-    WriteSshResults jobs, n, cmds, logDir, nOk
+    runLog = WriteSshRunLog(jobs, n, logDir, plink, user, devType, cmds)
+    WriteSshResults jobs, n, cmds, logDir, nOk, runLog
     For i = 1 To n
         If Not jobs(i).Ok Then summary = summary & vbCrLf & "   " & jobs(i).Host & ": " & jobs(i).Status
     Next i
     Application.StatusBar = False
     MsgBox nOk & " of " & n & " device(s) collected in " & Format$(ElapsedSeconds(t0), "0") & " s." & _
            IIf(Len(summary) > 0, vbCrLf & vbCrLf & "Problems:" & summary, "") & vbCrLf & vbCrLf & _
-           "Logs are also saved in:" & vbCrLf & logDir, IIf(nOk = n, vbInformation, vbExclamation), APP_NAME
+           "Logs are also saved in:" & vbCrLf & logDir & _
+           IIf(Len(runLog) > 0, vbCrLf & vbCrLf & "Details of every step (for troubleshooting):" & vbCrLf & runLog, ""), _
+           IIf(nOk = n, vbInformation, vbExclamation), APP_NAME
     GoTo Cleanup
 
 Handler:
@@ -2776,6 +2788,7 @@ Handler:
 Cleanup:
     On Error Resume Next
     pw = ""
+    mSshScrub = ""
     SshDeleteSecrets pwFile, cmdFile
     Kill tmpDir & "\job*.*"
     Application.StatusBar = False
@@ -2835,6 +2848,12 @@ Private Sub SshStart(ByRef job As SshJob, ByVal stage As Long, ByVal plink As St
         inner = Q(plink) & " -batch " & args & " < " & Q(cmdFile) & " > " & Q(job.BaseName & ".out") & _
                 " 2> " & Q(job.BaseName & ".err")
     End If
+    If stage = 1 Then
+        SshNote job, "Step 1: first connection to this device - storing its host key"
+    Else
+        SshNote job, "Step 2: logging in and running the commands"
+    End If
+    SshNote job, "  plink " & Mid$(inner, InStr(inner, "-ssh"))
     job.Pid = Shell("cmd.exe /c """ & inner & """", vbHide)
     job.hProc = OpenProcess(SYNCHRONIZE Or PROCESS_QUERY_LIMITED_INFORMATION, 0, job.Pid)
     job.Started = Timer
@@ -2859,16 +2878,26 @@ End Sub
 ' Called when a plink run ends: move to the next stage or record the result.
 Private Sub SshNextStep(ByRef job As SshJob, ByVal plink As String, ByVal user As String, _
         ByVal pwFile As String, ByVal cmdFile As String, ByVal logDir As String)
-    Dim errText As String
-    If job.hProc <> 0 Then CloseHandle job.hProc
+    Dim errText As String, code As Long, devErrors As String
+    code = -1
+    If job.hProc <> 0 Then
+        GetExitCodeProcess job.hProc, code
+        CloseHandle job.hProc
+    End If
     job.hProc = 0
+    job.ExitCode = code
+    SshNote job, "  plink finished after " & Format$(ElapsedSeconds(job.Started), "0.0") & " s, exit code " & _
+                 IIf(code = -1, "unknown", CStr(code)) & IIf(code = 0, " (OK)", "")
 
     If job.Stage = 1 Then
         ' Can't reach it at all? Stop here; otherwise collect (host key is now stored)
-        errText = LCase$(ReadTextFile(job.BaseName & "_k.err"))
-        If InStr(errText, "network error") > 0 Or InStr(errText, "host does not exist") > 0 Or _
-           InStr(errText, "unable to open connection") > 0 Then
-            job.Status = SshClassify("", ReadTextFile(job.BaseName & "_k.err"), job.Ok)
+        errText = ReadTextFile(job.BaseName & "_k.err")
+        job.ErrText = "[step 1]" & vbCrLf & errText
+        If InStr(LCase$(errText), "network error") > 0 Or InStr(LCase$(errText), "host does not exist") > 0 Or _
+           InStr(LCase$(errText), "unable to open connection") > 0 Then
+            job.Status = SshClassify("", errText, job.Ok)
+            job.Detail = SshDetail(errText)
+            SshNote job, "  Stopped: " & job.Status
             job.Stage = 3
         Else
             SshStart job, 2, plink, user, pwFile, cmdFile
@@ -2876,17 +2905,184 @@ Private Sub SshNextStep(ByRef job As SshJob, ByVal plink As String, ByVal user A
         Exit Sub
     End If
 
-    job.Output = ReadTextFile(job.BaseName & ".out")
-    job.Status = SshClassify(job.Output, ReadTextFile(job.BaseName & ".err"), job.Ok)
+    job.Output = ScrubSecret(ReadTextFile(job.BaseName & ".out"))
+    errText = ScrubSecret(ReadTextFile(job.BaseName & ".err"))
+    job.ErrText = job.ErrText & IIf(Len(job.ErrText) > 0, vbCrLf, "") & "[step 2]" & vbCrLf & errText
+    job.Status = SshClassify(job.Output, errText, job.Ok)
+    job.Detail = SshDetail(errText)
+    If job.Ok Then
+        ' Logged in, but did the device accept the commands?
+        devErrors = SshDeviceErrors(job.Output)
+        If Len(devErrors) > 0 Then
+            job.Status = "OK - but the device rejected some commands"
+            job.Detail = devErrors
+        ElseIf code <> 0 And code <> -1 Then
+            job.Status = "OK - but the session ended with an error (output may be incomplete)"
+        End If
+    End If
+    SshNote job, "  Result: " & job.Status
     If job.Ok Then
         job.SavedPath = logDir & "\" & Replace(job.Host, ":", "_") & " " & Format$(Now, "yyyy-mm-dd hhnnss") & ".txt"
-        On Error Resume Next
-        FileCopy job.BaseName & ".out", job.SavedPath
-        If Err.Number <> 0 Then job.SavedPath = ""
-        On Error GoTo 0
+        If Not WriteTextFile(job.SavedPath, job.Output) Then job.SavedPath = ""   ' (password masked)
     End If
     job.Stage = 3
 End Sub
+
+' Masks the AireOS password if the device echoed it back.
+Private Function ScrubSecret(ByVal text As String) As String
+    If Len(mSshScrub) > 0 Then ScrubSecret = Replace(text, mSshScrub, "********") Else ScrubSecret = text
+End Function
+
+Private Function WriteTextFile(ByVal path As String, ByVal text As String) As Boolean
+    Dim f As Integer
+    On Error GoTo Failed
+    f = FreeFile
+    Open path For Output As #f
+    Print #f, text;
+    Close #f
+    WriteTextFile = True
+    Exit Function
+Failed:
+    On Error Resume Next
+    Close #f
+End Function
+
+' Adds a time-stamped line to a device's timeline (for the run log).
+Private Sub SshNote(ByRef job As SshJob, ByVal msg As String)
+    job.Timeline = job.Timeline & Format$(Now, "hh:nn:ss") & "  " & msg & vbCrLf
+End Sub
+
+' A device ran out of time: keep whatever it sent so far, for diagnosis.
+Private Sub SshTimedOut(ByRef job As SshJob)
+    Dim limit As Long, sfx As String, errText As String
+    limit = IIf(job.Stage = 1, SSH_CONNECT_TIMEOUT_S, SSH_TIMEOUT_S)
+    sfx = IIf(job.Stage = 1, "_k", "")
+    errText = ScrubSecret(ReadTextFile(job.BaseName & sfx & ".err"))
+    job.Output = ScrubSecret(ReadTextFile(job.BaseName & sfx & ".out"))
+    job.ErrText = job.ErrText & IIf(Len(job.ErrText) > 0, vbCrLf, "") & "[step " & job.Stage & ", stopped]" & vbCrLf & errText
+    If job.Stage = 1 Then
+        job.Status = "Timed out after " & limit & " s while connecting / logging in"
+    ElseIf Len(Trim$(job.Output)) = 0 Then
+        job.Status = "Timed out after " & limit & " s - logged in? no output received"
+    Else
+        job.Status = "Timed out after " & limit & " s while running the commands (output is incomplete)"
+    End If
+    job.Detail = SshDetail(errText)
+    If Len(job.Detail) = 0 Then job.Detail = "Last thing received: " & LastLines(job.Output & errText, 2)
+    SshNote job, "  Stopped after " & limit & " s: " & job.Status
+    job.Stage = 3
+End Sub
+
+' plink's stderr without the login banner and routine lines - just the reasons.
+Private Function SshDetail(ByVal errText As String) As String
+    Dim line As Variant, l As String, s As String
+    For Each line In Split(Replace(errText, vbCr, ""), vbLf)
+        l = Trim$(CStr(line))
+        If Len(l) > 0 And Left$(l, 1) <> "|" And Left$(l, 1) <> ">" And Left$(l, 2) <> "--" _
+           And Left$(l, 1) <> "*" And InStr(l, "Using username") = 0 And InStr(l, "Access granted") = 0 _
+           And InStr(l, "Store key in cache") = 0 And InStr(l, "If you trust this host") = 0 _
+           And InStr(l, "If you want to carry on") = 0 And InStr(l, "If you do not trust") = 0 _
+           And InStr(l, "You have no guarantee") = 0 And InStr(l, "think it is") = 0 _
+           And InStr(l, "cache and carry on") = 0 And InStr(l, "connection.") <> 1 _
+           And InStr(l, "host key is not cached") = 0 And InStr(l, "(port ") = 0 _
+           And InStr(l, "key fingerprint is") = 0 And Left$(l, 4) <> "ssh-" And Left$(l, 6) <> "ecdsa-" _
+           And InStr(l, "Pre-authentication banner") = 0 Then
+            If InStr(s, l) = 0 Then
+                If Len(s) > 0 Then s = s & "  /  "
+                s = s & l
+            End If
+        End If
+    Next line
+    SshDetail = Left$(s, 400)
+End Function
+
+' Cisco "% ..." error lines in the device output, e.g. "% Invalid input detected".
+Private Function SshDeviceErrors(ByVal outText As String) As String
+    Dim line As Variant, l As String, prev As String, s As String, n As Long
+    For Each line In Split(Replace(outText, vbCr, ""), vbLf)
+        l = Trim$(CStr(line))
+        If Left$(l, 1) = "%" And (InStr(l, "Invalid input") > 0 Or InStr(l, "Incomplete command") > 0 Or _
+           InStr(l, "Ambiguous command") > 0 Or InStr(l, "Authorization failed") > 0 Or _
+           InStr(l, "Unknown command") > 0 Or InStr(LCase$(l), "not authorized") > 0) Then
+            n = n + 1
+            If n <= 3 Then
+                If Len(s) > 0 Then s = s & "  /  "
+                s = s & IIf(Len(prev) > 0, "after '" & Left$(prev, 80) & "': ", "") & l
+            End If
+        ElseIf Len(l) > 0 And Left$(l, 1) <> "^" Then
+            prev = l
+        End If
+    Next line
+    If n > 3 Then s = s & "  (+" & (n - 3) & " more)"
+    SshDeviceErrors = s
+End Function
+
+Private Function LastLines(ByVal text As String, ByVal count As Long) As String
+    Dim lines() As String, i As Long, s As String, got As Long
+    lines = Split(Trim$(Replace(text, vbCr, "")), vbLf)
+    For i = UBound(lines) To LBound(lines) Step -1
+        If Len(Trim$(lines(i))) > 0 Then
+            s = Trim$(lines(i)) & IIf(Len(s) > 0, "  /  " & s, "")
+            got = got + 1
+            If got >= count Then Exit For
+        End If
+    Next i
+    LastLines = Left$(s, 300)
+End Function
+
+' Writes the step-by-step log of the run (never the password) and returns its path.
+Private Function WriteSshRunLog(jobs() As SshJob, ByVal n As Long, ByVal logDir As String, _
+        ByVal plink As String, ByVal user As String, ByVal devType As Long, ByVal cmds As String) As String
+    Dim path As String, f As Integer, i As Long, ver As String
+    On Error GoTo Failed
+    path = logDir & "\_run " & Format$(Now, "yyyy-mm-dd hhnnss") & ".log"
+    ver = CreateObject("Scripting.FileSystemObject").GetFileVersion(plink)
+    f = FreeFile
+    Open path For Output As #f
+    Print #f, APP_NAME & " " & APP_VERSION & " - SSH Logs run log"
+    Print #f, "Started:     " & Format$(Now, "yyyy-mm-dd hh:nn:ss") & " on " & Environ$("COMPUTERNAME")
+    Print #f, "plink:       " & plink & IIf(Len(ver) > 0, "  (version " & ver & ")", "")
+    Print #f, "User:        " & user & "   (password not logged)"
+    Print #f, "Device type: " & IIf(devType = SSH_AIREOS, "Cisco AireOS", "Cisco IOS / IOS-XE")
+    Print #f, "Commands:    " & cmds
+    Print #f, "Timeouts:    " & SSH_CONNECT_TIMEOUT_S & " s first connection, " & SSH_TIMEOUT_S & " s per device"
+    For i = 1 To n
+        Print #f, ""
+        Print #f, String$(78, "=")
+        Print #f, jobs(i).Host & "  -  " & jobs(i).Status
+        Print #f, String$(78, "=")
+        If Len(jobs(i).Detail) > 0 Then Print #f, "Details: " & jobs(i).Detail
+        Print #f, jobs(i).Timeline;
+        If Len(Trim$(jobs(i).ErrText)) > 0 Then
+            Print #f, "--- messages from plink (stderr) ---"
+            Print #f, Replace(jobs(i).ErrText, vbCr, "")
+        End If
+        If Not jobs(i).Ok Or Left$(jobs(i).Status, 4) = "OK -" Then
+            Print #f, "--- last 40 lines received from the device ---"
+            Print #f, LastLinesBlock(jobs(i).Output, 40)
+        End If
+    Next i
+    Close #f
+    WriteSshRunLog = path
+    Exit Function
+Failed:
+    On Error Resume Next
+    Close #f
+    WriteSshRunLog = ""
+End Function
+
+Private Function LastLinesBlock(ByVal text As String, ByVal count As Long) As String
+    Dim lines() As String, first As Long, i As Long, s As String
+    text = Replace(text, vbCr, "")
+    If Len(Trim$(text)) = 0 Then LastLinesBlock = "(nothing)": Exit Function
+    lines = Split(text, vbLf)
+    first = UBound(lines) - count + 1
+    If first < 0 Then first = 0
+    For i = first To UBound(lines)
+        s = s & lines(i) & vbLf
+    Next i
+    LastLinesBlock = s
+End Function
 
 ' Turns plink's output/errors into a short status. ok = True if we got output.
 Private Function SshClassify(ByVal outText As String, ByVal errText As String, ByRef ok As Boolean) As String
@@ -2934,19 +3130,21 @@ NotKnown:
 End Function
 
 Private Sub WriteSshResults(jobs() As SshJob, ByVal n As Long, ByVal cmds As String, _
-        ByVal logDir As String, ByRef nOk As Long)
+        ByVal logDir As String, ByRef nOk As Long, ByVal runLog As String)
     Dim ws As Worksheet, sumWs As Worksheet, lo As ListObject, out() As Variant, i As Long, k As Long
     Dim lines() As String, arr() As Variant, cnt As Long, sheetNames() As String
 
-    ReDim out(1 To n, 1 To 4), sheetNames(1 To n)
+    ReDim out(1 To n, 1 To 5), sheetNames(1 To n)
     Set sumWs = NewResultSheet("SSH Summary")
     Set lo = StartResultTable(sumWs, "SSH Logs  -  " & cmds, _
-                              Array("Device", "Status", "Lines", "Saved log"), n)
+                              Array("Device", "Status", "Details", "Lines", "Saved log"), n)
+    If Len(runLog) > 0 Then sumWs.Cells(3, 1).Value = "Step-by-step log of this run: " & runLog
 
     Application.ScreenUpdating = False
     For i = 1 To n
         out(i, 1) = jobs(i).Host
         out(i, 2) = jobs(i).Status
+        out(i, 3) = jobs(i).Detail
         If jobs(i).Ok Then
             nOk = nOk + 1
             lines = Split(Replace(jobs(i).Output, vbCr, ""), vbLf)
@@ -2967,14 +3165,18 @@ Private Sub WriteSshResults(jobs() As SshJob, ByVal n As Long, ByVal cmds As Str
                 .Font.Size = 9
             End With
             ws.Columns("A").ColumnWidth = 160
-            out(i, 3) = cnt
-            out(i, 4) = jobs(i).SavedPath
+            out(i, 4) = cnt
+            out(i, 5) = jobs(i).SavedPath
         End If
     Next i
 
     lo.DataBodyRange.Value = out
     For i = 1 To n
-        If jobs(i).Ok Then
+        If jobs(i).Ok And Left$(jobs(i).Status, 4) = "OK -" Then
+            Warn lo.DataBodyRange.Cells(i, 2)
+            sumWs.Hyperlinks.Add Anchor:=lo.DataBodyRange.Cells(i, 1), Address:="", _
+                SubAddress:="'" & sheetNames(i) & "'!A1", TextToDisplay:=jobs(i).Host
+        ElseIf jobs(i).Ok Then
             Good lo.DataBodyRange.Cells(i, 2)
             sumWs.Hyperlinks.Add Anchor:=lo.DataBodyRange.Cells(i, 1), Address:="", _
                 SubAddress:="'" & sheetNames(i) & "'!A1", TextToDisplay:=jobs(i).Host

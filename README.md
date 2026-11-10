@@ -156,6 +156,28 @@ NetTools connects to 8 devices at a time and then adds:
   to the device's sheet;
 - one **SSH <device>** sheet per device with the full output, one line per row;
 - a copy of every log in `Documents\NetTools\SSH Logs\<device> <date time>.txt`.
+- a **run log** for troubleshooting, `Documents\NetTools\SSH Logs\_run <date time>.log`.
+  For each device it has a timeline of every step with times, plink's exit code,
+  every message plink printed, and, for devices that failed, the last 40 lines
+  they sent. The password is never written to it.
+
+**Why did a device fail?** Look at the **Details** column on the SSH Summary
+sheet first. It shows plink's actual messages without the login banner, e.g.
+`Access denied / FATAL ERROR: Remote side unexpectedly closed network connection`,
+or the device's own error, e.g. `after 'show run': % Invalid input detected`.
+Statuses include:
+- `OK`: collected.
+- `OK - but the device rejected some commands`: logged in, but a command
+  was refused (typo, or not allowed for your account). Details shows which.
+- `OK - but the session ended with an error`: output may be incomplete.
+- `Login failed - wrong username or password`.
+- `Timed out after 30 s while connecting / logging in`: no login prompt in
+  time (slow AAA or a firewall).
+- `Timed out after 120 s while running the commands`: logged in, but the
+  commands didn't finish. The output so far is in the run log.
+- `Connection timed out` / `SSH refused (port 22 closed)` / `Host name not found`.
+
+For anything unclear, open the run log, which has the full story per device.
 
 How it works and what to know:
 - It uses PuTTY's `plink.exe`, which the MSI installs to `%APPDATA%\NetTools`.
@@ -235,7 +257,7 @@ Also available in formulas, if you want results next to your own data:
 
 ### MSI (recommended)
 
-Double-click `NetTools-3.3.2.msi` and close Excel first if it's open. No admin
+Double-click `NetTools-3.4.0.msi` and close Excel first if it's open. No admin
 rights are needed. The installer puts `NetTools.xlam` in your Excel startup
 folder (`%APPDATA%\Microsoft\Excel\XLSTART`). Excel loads it every time it
 starts, and because that folder is one of Office's default trusted
@@ -243,7 +265,7 @@ locations, the macros run without a security prompt.
 
 - Uninstall: **Settings > Apps > NetTools for Excel**.
 - Upgrade: run a newer MSI. It replaces the old version.
-- Silent / Intune / SCCM: `msiexec /i NetTools-3.3.2.msi /qn`. This is a
+- Silent / Intune / SCCM: `msiexec /i NetTools-3.4.0.msi /qn`. This is a
   **per-user** MSI, so deploy it in the *user* context.
 
 If your company uses Group Policy to turn off trusted locations or block
