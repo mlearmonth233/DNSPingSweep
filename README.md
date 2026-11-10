@@ -186,18 +186,28 @@ and /32 is a single host. IPv4 only.
 
 ### Speed
 
-Forward lookups go through the Windows resolver, so the answers match what
-the PC itself sees (DNS suffixes, hosts file and so on). Reverse (PTR)
-lookups for IPv4 go straight to DNS, so an address with no PTR record
-doesn't stall while Windows tries NetBIOS.
+Check DNS, DNS Only, Ping Only and Subnet Scan do their DNS **for the whole
+list at once**:
 
-Check DNS and Ping Only look up each host first, then ping **all hosts at
-the same time**, in up to 4 rounds (`PING_COUNT`) of 1 second each
-(`PING_TIMEOUT_MS`). A host that misses **2 pings in a row**
-(`PING_DEAD_AFTER`) counts as down and gets no more pings. A list of 200
-hosts therefore pings in about 4 seconds, the same as a single host. All
-three settings are at the top of `src/NetTools.bas`. IPv6-only hosts are
-pinged one at a time.
+- **Forward lookups** (name to IP) use the Windows asynchronous DNS call
+  (`GetAddrInfoExW`), up to 128 at a time, DNS only. A name that doesn't
+  exist fails in milliseconds instead of waiting seconds for LLMNR/NetBIOS.
+  On Windows 7 (no asynchronous lookups) NetTools falls back to one at a time.
+- **Reverse lookups** (PTR) are sent straight to your PC's DNS servers as
+  ordinary DNS queries, up to 200 at a time, each with a 1.5 s timeout and
+  one retry to the next DNS server. If no DNS server answers at all,
+  NetTools falls back to one at a time.
+- **Ping** happens after DNS, for all hosts together, in up to 4 rounds of
+  1 second. A host that misses **2 pings in a row** counts as down.
+- Results are written to the sheet in one go.
+
+The pop-up at the end shows how long DNS and ping each took, e.g.
+`Checked 250 host(s) in 6.1 s (DNS 1.9 s, ping 4.0 s)`. If DNS is still
+slow, your DNS server is slow to answer, or reverse zones are missing and
+queries for them time out.
+
+Timeouts and batch sizes are constants at the top of `src/NetTools.bas`
+(`LOOKUP_*`, `DNS_*`, `PING_*`).
 
 ### Worksheet functions
 
@@ -221,7 +231,7 @@ Also available in formulas, if you want results next to your own data:
 
 ### MSI (recommended)
 
-Double-click `NetTools-3.2.0.msi` and close Excel first if it's open. No admin
+Double-click `NetTools-3.3.0.msi` and close Excel first if it's open. No admin
 rights are needed. The installer puts `NetTools.xlam` in your Excel startup
 folder (`%APPDATA%\Microsoft\Excel\XLSTART`). Excel loads it every time it
 starts, and because that folder is one of Office's default trusted
@@ -229,7 +239,7 @@ locations, the macros run without a security prompt.
 
 - Uninstall: **Settings > Apps > NetTools for Excel**.
 - Upgrade: run a newer MSI. It replaces the old version.
-- Silent / Intune / SCCM: `msiexec /i NetTools-3.2.0.msi /qn`. This is a
+- Silent / Intune / SCCM: `msiexec /i NetTools-3.3.0.msi /qn`. This is a
   **per-user** MSI, so deploy it in the *user* context.
 
 If your company uses Group Policy to turn off trusted locations or block

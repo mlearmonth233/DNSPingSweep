@@ -41,7 +41,7 @@ Private Const PING_COUNT As Long = 4             ' echo requests per host (like 
 Private Const PING_TIMEOUT_MS As Long = 1000     ' per echo request
 Private Const PING_DEAD_AFTER As Long = 2        ' stop pinging a host after this many misses in a row
 Private Const APP_NAME As String = "NetTools"
-Private Const APP_VERSION As String = "3.2.0"
+Private Const APP_VERSION As String = "3.3.0"
 
 ' ---- Result column headers ---------------------------------------------------
 Private Const H_HOST As String = "Host / IP"
@@ -193,6 +193,28 @@ Private Declare PtrSafe Function ws_select Lib "ws2_32.dll" Alias "select" (ByVa
 Private Declare PtrSafe Function getsockopt Lib "ws2_32.dll" (ByVal s As LongPtr, ByVal level As Long, _
     ByVal optname As Long, ByRef optval As Long, ByRef optlen As Long) As Long
 Private Declare PtrSafe Function WSAGetLastError Lib "ws2_32.dll" () As Long
+
+' ---- Fast DNS: many lookups at once -------------------------------------------
+Private Const NS_DNS As Long = 12
+Private Const SOCK_DGRAM As Long = 2
+Private Const IPPROTO_UDP As Long = 17
+Private Const LOOKUP_PARALLEL As Long = 128      ' forward lookups in flight (GetAddrInfoExW async)
+Private Const LOOKUP_TIMEOUT_S As Long = 4       ' per forward lookup
+Private Const DNS_PARALLEL As Long = 200         ' reverse (PTR) queries in flight
+Private Const DNS_TIMEOUT_MS As Long = 1500      ' per PTR query (then one retry)
+Private Declare PtrSafe Function GetAddrInfoExW Lib "ws2_32.dll" (ByVal pName As LongPtr, _
+    ByVal pServiceName As LongPtr, ByVal dwNameSpace As Long, ByVal lpNspId As LongPtr, _
+    ByVal hints As LongPtr, ByVal ppResult As LongPtr, ByVal timeout As LongPtr, _
+    ByVal lpOverlapped As LongPtr, ByVal lpCompletionRoutine As LongPtr, ByVal lpNameHandle As LongPtr) As Long
+Private Declare PtrSafe Function GetAddrInfoExOverlappedResult Lib "ws2_32.dll" (ByVal lpOverlapped As LongPtr) As Long
+Private Declare PtrSafe Function GetAddrInfoExCancel Lib "ws2_32.dll" (ByVal lpHandle As LongPtr) As Long
+Private Declare PtrSafe Sub FreeAddrInfoExW Lib "ws2_32.dll" (ByVal pAddrInfoEx As LongPtr)
+Private Declare PtrSafe Function DnsQueryConfig Lib "dnsapi.dll" (ByVal Config As Long, ByVal Flag As Long, _
+    ByVal pwsAdapterName As LongPtr, ByVal pReserved As LongPtr, ByVal pBuffer As LongPtr, ByRef pBufLen As Long) As Long
+Private Declare PtrSafe Function ws_sendto Lib "ws2_32.dll" Alias "sendto" (ByVal s As LongPtr, _
+    ByVal buf As LongPtr, ByVal length As Long, ByVal flags As Long, ByVal toAddr As LongPtr, ByVal tolen As Long) As Long
+Private Declare PtrSafe Function ws_recvfrom Lib "ws2_32.dll" Alias "recvfrom" (ByVal s As LongPtr, _
+    ByVal buf As LongPtr, ByVal length As Long, ByVal flags As Long, ByVal fromAddr As LongPtr, ByRef fromlen As Long) As Long
 
 ' ---- SSH (plink.exe child processes) ------------------------------------------
 Private Const SSH_PARALLEL As Long = 8              ' devices at once
@@ -365,6 +387,7 @@ Private Sub RunChecks(ByVal doDns As Boolean, ByVal doPing As Boolean)
     Dim i As Long, total As Long, done As Long, host As String, res As HostResult
     Dim nUp As Long, nDown As Long, nLoss As Long, nDnsFail As Long, nMismatch As Long
     Dim t0 As Double, wsaOk As Boolean, msg As String, results() As HostResult
+    Dim tDns As Double, tPing As Double, tStep As Double
 
     Set items = GetInputList("Hostnames or IP addresses to check, separated by commas or spaces:", False, srcDesc)
     If items Is Nothing Then Exit Sub
@@ -392,30 +415,19 @@ Private Sub RunChecks(ByVal doDns As Boolean, ByVal doPing As Boolean)
         GoTo Cleanup
     End If
 
-    ' 1. Look up every host (rows appear as they're done)
-    ReDim results(1 To total)
-    For i = 1 To total
-        host = items(i)
-        Application.StatusBar = APP_NAME & ": " & IIf(doDns, "DNS ", "resolving ") & host & _
-                                "  (" & i & " of " & total & ")   -   press Esc to stop"
-        results(i) = CheckHost(host, doDns, False)
-        Set rowRng = lo.DataBodyRange.Rows(i)
-        rowRng.Value = ResultToRow(host, results(i), doDns, doPing)
-        If Not doPing Then ColourRow rowRng, headers, results(i)
-        done = i
-        DoEvents
-    Next i
+    ' 1. DNS for every host at once
+    tStep = Timer
+    BatchLookup items, results, doDns
+    done = total
+    tDns = ElapsedSeconds(tStep)
+    WriteHostRows lo, items, results, headers, doDns, doPing, Not doPing
 
     ' 2. Ping them all at once
     If doPing Then
+        tStep = Timer
         PingAll results, total
-        Application.ScreenUpdating = False
-        For i = 1 To total
-            Set rowRng = lo.DataBodyRange.Rows(i)
-            rowRng.Value = ResultToRow(CStr(items(i)), results(i), doDns, doPing)
-            ColourRow rowRng, headers, results(i)
-        Next i
-        Application.ScreenUpdating = True
+        tPing = ElapsedSeconds(tStep)
+        WriteHostRows lo, items, results, headers, doDns, doPing, True
     End If
 
     For i = 1 To total
@@ -428,7 +440,9 @@ Private Sub RunChecks(ByVal doDns As Boolean, ByVal doPing As Boolean)
     Next i
 
     FinishTable lo, done
-    msg = "Checked " & done & " host(s) in " & Format$(ElapsedSeconds(t0), "0.0") & " s." & vbCrLf & vbCrLf
+    msg = "Checked " & done & " host(s) in " & Format$(ElapsedSeconds(t0), "0.0") & " s" & _
+          "  (DNS " & Format$(tDns, "0.0") & " s" & IIf(doPing, ", ping " & Format$(tPing, "0.0") & " s", "") & ")." & _
+          vbCrLf & vbCrLf
     If doDns Then
         msg = msg & "DNS lookup failed: " & nDnsFail & vbCrLf & _
                     "Forward/reverse mismatch or no PTR: " & nMismatch & vbCrLf
@@ -760,76 +774,124 @@ End Sub
 '==============================================================================
 ' Checking one host
 '==============================================================================
-Private Function CheckHost(ByVal host As String, ByVal doDns As Boolean, ByVal doPing As Boolean) As HostResult
-    Dim res As HostResult, addrs As Collection, fwd As Collection, canonical As String
-    Dim lat As Variant, ttl As Variant, received As Long, sent As Long
+' DNS for a whole list at once: forward lookups in parallel, then reverse
+' (PTR) lookups in parallel, then - for IP inputs - a parallel forward check
+' of each PTR name. Fills results(1..n). Ping is done separately (PingAll).
+Private Sub BatchLookup(items As Collection, results() As HostResult, ByVal doDns As Boolean)
+    Dim n As Long, i As Long, host As String, canon As String, addrs As Collection
+    Dim names As New Collection, seen As Object, fwd As Object, ptrs As Object, ipList As New Collection
+    Dim names2 As New Collection, fwd2 As Object, ptr As String, isIp() As Boolean
 
-    res.Latency = Empty
-    res.Ttl = Empty
-    canonical = NumericAddress(host)
+    n = items.Count
+    ReDim results(1 To n), isIp(1 To n)
+    Set seen = CreateObject("Scripting.Dictionary")
+    seen.CompareMode = 1
 
-    If Len(canonical) > 0 Then
-        ' ---- Input is an IP address ----
-        res.InputType = "IP"
-        res.Addresses = canonical
-        res.FirstAddr = canonical
-        If doDns Then
-            res.Ptr = FastPtr(canonical)
-            If Len(res.Ptr) = 0 Then
-                res.Ptr = "(no PTR record)"
-                res.Match = "No PTR"
+    ' Which are already IP addresses?
+    For i = 1 To n
+        host = items(i)
+        canon = NumericAddress(host)
+        results(i).Latency = Empty
+        results(i).Ttl = Empty
+        If Len(canon) > 0 Then
+            isIp(i) = True
+            results(i).InputType = "IP"
+            results(i).Addresses = canon
+            results(i).FirstAddr = canon
+        Else
+            results(i).InputType = "Hostname"
+            If Not seen.Exists(host) Then seen.Add host, True: names.Add host
+        End If
+    Next i
+
+    ' Forward lookups
+    Set fwd = ParallelResolve(names, IIf(doDns, "DNS", "resolving"))
+    For i = 1 To n
+        If Not isIp(i) Then
+            Set addrs = fwd(CStr(items(i)))
+            If addrs.Count = 0 Then
+                results(i).DnsFailed = True
+                results(i).Addresses = "(not found)"
+                results(i).FirstAddr = "(not found)"
+                results(i).Match = "n/a"
+                results(i).PingStatus = "Not resolved"
             Else
-                ' Forward-confirm: does the PTR name resolve back to this IP?
-                Set fwd = LookupAddresses(res.Ptr)
-                If fwd.Count = 0 Then
-                    res.Match = "No - PTR name does not resolve"
-                ElseIf InCollection(fwd, canonical) Then
-                    res.Match = "Yes"
+                results(i).Addresses = JoinCollection(addrs)
+                results(i).FirstAddr = addrs(1)
+            End If
+        End If
+    Next i
+    If Not doDns Then Exit Sub
+
+    ' Reverse lookups for each host's first address
+    seen.RemoveAll
+    For i = 1 To n
+        If Not results(i).DnsFailed Then
+            If Not seen.Exists(results(i).FirstAddr) Then seen.Add results(i).FirstAddr, True: ipList.Add results(i).FirstAddr
+        End If
+    Next i
+    Set ptrs = ParallelPtr(ipList, "reverse DNS")
+
+    ' For IP inputs: does the PTR name point back to the IP?
+    seen.RemoveAll
+    For i = 1 To n
+        If isIp(i) Then
+            ptr = ptrs(results(i).FirstAddr)
+            If Len(ptr) > 0 And Not seen.Exists(ptr) Then seen.Add ptr, True: names2.Add ptr
+        End If
+    Next i
+    Set fwd2 = ParallelResolve(names2, "forward check")
+
+    For i = 1 To n
+        If Not results(i).DnsFailed Then
+            ptr = ptrs(results(i).FirstAddr)
+            If Len(ptr) = 0 Then
+                results(i).Ptr = "(no PTR record)"
+                results(i).Match = "No PTR"
+            ElseIf isIp(i) Then
+                results(i).Ptr = ptr
+                Set addrs = fwd2(ptr)
+                If addrs.Count = 0 Then
+                    results(i).Match = "No - PTR name does not resolve"
+                ElseIf InCollection(addrs, results(i).FirstAddr) Then
+                    results(i).Match = "Yes"
                 Else
-                    res.Match = "No - PTR name resolves to " & JoinCollection(fwd)
+                    results(i).Match = "No - PTR name resolves to " & JoinCollection(addrs)
+                End If
+            Else
+                results(i).Ptr = ptr
+                If NamesMatch(CStr(items(i)), ptr) Then
+                    results(i).Match = "Yes"
+                Else
+                    results(i).Match = "No - PTR is a different name"
                 End If
             End If
         End If
-    Else
-        ' ---- Input is a hostname ----
-        res.InputType = "Hostname"
-        Set addrs = LookupAddresses(host)
-        If addrs.Count = 0 Then
-            res.DnsFailed = True
-            res.Addresses = "(not found)"
-            res.FirstAddr = "(not found)"
-            res.Ptr = ""
-            res.Match = "n/a"
-            res.PingStatus = "Not resolved"
-            CheckHost = res
-            Exit Function
-        End If
-        res.Addresses = JoinCollection(addrs)
-        res.FirstAddr = addrs(1)
-        If doDns Then
-            res.Ptr = FastPtr(res.FirstAddr)
-            If Len(res.Ptr) = 0 Then
-                res.Ptr = "(no PTR record)"
-                res.Match = "No PTR"
-            ElseIf NamesMatch(host, res.Ptr) Then
-                res.Match = "Yes"
-            Else
-                res.Match = "No - PTR is a different name"
-            End If
-        End If
-    End If
+    Next i
+End Sub
 
-    If doPing Then
-        res.PingStatus = PingHost(res.FirstAddr, lat, ttl, received, sent)
-        res.Replies = received & "/" & sent
-        res.PingUp = (received > 0)
-        res.PingLoss = (received > 0 And received < sent)
-        res.Latency = lat
-        res.Ttl = ttl
+' Writes every result row in one go (much faster than row by row).
+Private Sub WriteHostRows(ByVal lo As ListObject, items As Collection, results() As HostResult, _
+        ByVal headers As Variant, ByVal doDns As Boolean, ByVal doPing As Boolean, ByVal colour As Boolean)
+    Dim n As Long, i As Long, j As Long, rowVals() As Variant, out() As Variant, nCols As Long
+    n = items.Count
+    nCols = UBound(headers) - LBound(headers) + 1
+    ReDim out(1 To n, 1 To nCols)
+    For i = 1 To n
+        rowVals = ResultToRow(CStr(items(i)), results(i), doDns, doPing)
+        For j = 0 To nCols - 1
+            out(i, j + 1) = rowVals(j)
+        Next j
+    Next i
+    Application.ScreenUpdating = False
+    lo.DataBodyRange.Value = out
+    If colour Then
+        For i = 1 To n
+            ColourRow lo.DataBodyRange.Rows(i), headers, results(i)
+        Next i
     End If
-
-    CheckHost = res
-End Function
+    Application.ScreenUpdating = True
+End Sub
 
 ' "server1" matches "server1.corp.example.com"; full names must match exactly.
 Private Function NamesMatch(ByVal a As String, ByVal b As String) As Boolean
@@ -973,6 +1035,341 @@ Private Function JoinCollection(ByVal c As Collection) As String
         s = s & CStr(item)
     Next item
     JoinCollection = s
+End Function
+
+'==============================================================================
+' Fast DNS - many lookups at once
+'==============================================================================
+
+' Forward lookups for many names at once: GetAddrInfoExW in asynchronous mode
+' (Windows 8+), DNS only - so names that don't exist fail fast instead of
+' waiting on LLMNR/NetBIOS. Returns a Dictionary: name -> Collection of
+' addresses (IPv4 first). Falls back to one-at-a-time where async isn't
+' available.
+Private Function ParallelResolve(names As Collection, ByVal label As String) As Object
+    Dim d As Object, n As Long, i As Long, k As Long, used As Long, g As Long, cnt As Long, done As Long
+    Dim nm() As String, slot() As Long, res() As LongPtr, hnd() As LongPtr, ev() As LongPtr, ov() As Byte
+    Dim pending() As Boolean, rcs() As Long, hints(0 To 19) As Long, tv(0 To 1) As Long
+    Dim rc As Long, evOfs As Long, t0 As Double, waitMs As Long, errNum As Long, errDesc As String
+
+    Set d = CreateObject("Scripting.Dictionary")
+    d.CompareMode = 1
+    Set ParallelResolve = d
+    n = names.Count
+    If n = 0 Then Exit Function
+
+    ReDim nm(1 To n)
+    For i = 1 To n
+        nm(i) = names(i)
+    Next i
+    ReDim slot(0 To LOOKUP_PARALLEL - 1), res(0 To LOOKUP_PARALLEL - 1), hnd(0 To LOOKUP_PARALLEL - 1)
+    ReDim ev(0 To LOOKUP_PARALLEL - 1), pending(0 To LOOKUP_PARALLEL - 1), rcs(0 To LOOKUP_PARALLEL - 1)
+    ReDim ov(0 To 31, 0 To LOOKUP_PARALLEL - 1)        ' one OVERLAPPED per lookup
+    evOfs = 2 * PTR_SIZE + 8                            ' OVERLAPPED.hEvent
+    hints(2) = SOCK_STREAM                              ' ADDRINFOEXW.ai_socktype
+    tv(0) = LOOKUP_TIMEOUT_S
+    For k = 0 To LOOKUP_PARALLEL - 1
+        ev(k) = CreateEventA(0, 1, 0, 0)
+    Next k
+
+    On Error GoTo Done
+    i = 1
+    Do While i <= n
+        Application.StatusBar = APP_NAME & ": " & label & " (" & done & " of " & n & ")   -   press Esc to stop"
+        DoEvents
+        used = 0
+        Do While i <= n And used < LOOKUP_PARALLEL
+            slot(used) = i: res(used) = 0: hnd(used) = 0
+            RtlZeroMemory VarPtr(ov(0, used)), 32
+            ResetEvent ev(used)
+            CopyMemory ov(evOfs, used), VarPtr(ev(used)), PTR_SIZE
+            rc = GetAddrInfoExW(StrPtr(nm(i)), 0, NS_DNS, 0, VarPtr(hints(0)), VarPtr(res(used)), _
+                                VarPtr(tv(0)), VarPtr(ov(0, used)), 0, VarPtr(hnd(used)))
+            pending(used) = (rc = 997)                      ' WSA_IO_PENDING
+            rcs(used) = rc
+            If Not pending(used) Then SetEvent ev(used)
+            used = used + 1
+            i = i + 1
+        Loop
+
+        t0 = Timer
+        For g = 0 To used - 1 Step 64
+            cnt = used - g
+            If cnt > 64 Then cnt = 64
+            waitMs = (LOOKUP_TIMEOUT_S + 1) * 1000 - CLng((Timer - t0) * 1000)
+            If waitMs < 1 Then waitMs = 1
+            WaitForMultipleObjects cnt, VarPtr(ev(g)), 1, waitMs
+        Next g
+
+        For k = 0 To used - 1
+            If pending(k) Then
+                If WaitForSingleObject(ev(k), 0) <> 0 Then
+                    GetAddrInfoExCancel VarPtr(hnd(k))
+                    WaitForSingleObject ev(k), 2000
+                End If
+                rcs(k) = GetAddrInfoExOverlappedResult(VarPtr(ov(0, k)))
+            End If
+            Select Case rcs(k)
+                Case 0
+                    Set d(nm(slot(k))) = AddrInfoExToCollection(res(k))
+                Case 11001, 11002, 11004, 10060, 10111, 997, 1460
+                    ' not found / no data / server failure / timed out / cancelled
+                    Set d(nm(slot(k))) = New Collection
+                Case Else
+                    ' asynchronous lookups not supported here (e.g. Windows 7): the normal way
+                    Set d(nm(slot(k))) = LookupAddresses(nm(slot(k)))
+            End Select
+            If res(k) <> 0 Then FreeAddrInfoExW res(k): res(k) = 0
+        Next k
+        done = done + used
+    Loop
+
+Done:
+    errNum = Err.Number: errDesc = Err.Description
+    For k = 0 To LOOKUP_PARALLEL - 1
+        If ev(k) <> 0 Then CloseHandle ev(k)
+    Next k
+    If errNum <> 0 Then Err.Raise errNum, , errDesc
+End Function
+
+' ADDRINFOEXW list -> Collection of address strings, IPv4 first.
+' ADDRINFOEXW: family @4, addrlen @16, addr @16+2*ptr, next @16+6*ptr
+Private Function AddrInfoExToCollection(ByVal p As LongPtr) As Collection
+    Dim v4 As New Collection, v6 As New Collection, all As New Collection, ip As String, item As Variant
+    Do While p <> 0
+        ip = SockaddrToString(ReadPtr(p + 16 + 2 * PTR_SIZE), ReadLong(p + 16), NI_NUMERICHOST)
+        If Len(ip) > 0 Then
+            If ReadLong(p + 4) = AF_INET Then AddUnique v4, ip Else AddUnique v6, ip
+        End If
+        p = ReadPtr(p + 16 + 6 * PTR_SIZE)
+    Loop
+    For Each item In v4: all.Add item: Next item
+    For Each item In v6: all.Add item: Next item
+    Set AddrInfoExToCollection = all
+End Function
+
+' Reverse (PTR) lookups for many IPv4 addresses at once: NetTools sends the
+' DNS queries itself, over UDP, to the PC's configured DNS servers - up to
+' DNS_PARALLEL at a time, one retry (to the next server). Returns a
+' Dictionary: ip -> PTR name ("" if none). IPv6 uses the Windows resolver.
+' Falls back to one-at-a-time if no DNS server answers at all.
+Private Function ParallelPtr(ips As Collection, ByVal label As String) As Object
+    Dim d As Object, servers As Collection, n As Long, k As Long, ip As Variant, list() As String, got() As Boolean
+    Dim s As LongPtr, nb As Long, sa(0 To 15) As Byte, q() As Byte, qlen As Long, anyAnswer As Boolean
+    Dim attempt As Long, first As Long, last As Long, waiting As Long, deadline As Double, remaining As Long
+    Dim fds(0 To 15) As Byte, tv(0 To 1) As Long, rbuf(0 To 1499) As Byte, rlen As Long
+    Dim fromBuf(0 To 15) As Byte, fromLen As Long, id As Long, nm As String, done As Long, one As Long
+    Dim errNum As Long, errDesc As String
+
+    Set d = CreateObject("Scripting.Dictionary")
+    Set ParallelPtr = d
+    ReDim list(1 To ips.Count + 1)
+    For Each ip In ips
+        If Not d.Exists(CStr(ip)) Then
+            If InStr(CStr(ip), ":") > 0 Then
+                d(CStr(ip)) = ReverseLookup(CStr(ip))
+            Else
+                d(CStr(ip)) = ""
+                n = n + 1
+                list(n) = CStr(ip)
+            End If
+        End If
+    Next ip
+    If n = 0 Then Exit Function
+    ReDim got(1 To n)
+
+    Set servers = DnsServerList()
+    If servers.Count = 0 Then GoTo OneByOne
+    s = ws_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+    If s = 0 Or s = -1 Then s = 0: GoTo OneByOne
+    nb = 1
+    ioctlsocket s, FIONBIO, nb
+
+    On Error GoTo Fail
+    For attempt = 1 To 2
+        BuildSockaddrV4 sa, servers(1 + (attempt - 1) Mod servers.Count), 53
+        first = 1
+        Do While first <= n
+            last = first + DNS_PARALLEL - 1
+            If last > n Then last = n
+            waiting = 0
+            For k = first To last
+                If Not got(k) Then
+                    qlen = BuildPtrQuery(q, list(k), k)
+                    ws_sendto s, VarPtr(q(0)), qlen, 0, VarPtr(sa(0)), 16
+                    waiting = waiting + 1
+                End If
+            Next k
+
+            deadline = Timer + DNS_TIMEOUT_MS / 1000#
+            Do While waiting > 0
+                remaining = CLng((deadline - Timer) * 1000)
+                If remaining <= 0 Then Exit Do
+                one = 1
+                CopyMemory fds(0), VarPtr(one), 4                 ' fd_set: 1 socket
+                CopyMemory fds(PTR_SIZE), VarPtr(s), PTR_SIZE
+                tv(0) = remaining \ 1000
+                tv(1) = (remaining Mod 1000) * 1000
+                If ws_select(0, VarPtr(fds(0)), 0, 0, VarPtr(tv(0))) <= 0 Then Exit Do
+                Do
+                    fromLen = 16
+                    rlen = ws_recvfrom(s, VarPtr(rbuf(0)), 1500, 0, VarPtr(fromBuf(0)), fromLen)
+                    If rlen <= 0 Then Exit Do
+                    If ParsePtrResponse(rbuf, rlen, id, nm) Then
+                        anyAnswer = True
+                        If id >= 1 And id <= n Then
+                            If Not got(id) Then
+                                got(id) = True
+                                d(list(id)) = nm
+                                done = done + 1
+                                If id >= first And id <= last Then waiting = waiting - 1
+                            End If
+                        End If
+                    End If
+                Loop
+            Loop
+            Application.StatusBar = APP_NAME & ": " & label & " (" & done & " of " & n & ")   -   press Esc to stop"
+            DoEvents
+            first = last + 1
+        Loop
+        If done = n Then Exit For
+    Next attempt
+    closesocket s
+    s = 0
+    If anyAnswer Then Exit Function
+
+OneByOne:
+    ' No DNS server answered our queries (none found, or UDP blocked): the slow way
+    On Error GoTo Fail
+    For k = 1 To n
+        If k Mod 8 = 1 Then
+            Application.StatusBar = APP_NAME & ": " & label & " (" & k & " of " & n & ")   -   press Esc to stop"
+            DoEvents
+        End If
+        d(list(k)) = PtrLookupDns(list(k))
+    Next k
+    Exit Function
+
+Fail:
+    errNum = Err.Number: errDesc = Err.Description
+    If s <> 0 And s <> -1 Then closesocket s
+    Err.Raise errNum, , errDesc
+End Function
+
+' The PC's IPv4 DNS servers, in order.
+Private Function DnsServerList() As Collection
+    Dim c As New Collection, size As Long, buf() As Byte, cnt As Long, i As Long, b As Long
+    Set DnsServerList = c
+    On Error GoTo Done
+    DnsQueryConfig 6, 0, 0, 0, 0, size                ' 6 = DnsConfigDnsServerList (IP4_ARRAY)
+    If size < 8 Then Exit Function
+    ReDim buf(0 To size - 1)
+    If DnsQueryConfig(6, 0, 0, 0, VarPtr(buf(0)), size) <> 0 Then Exit Function
+    cnt = ReadLong(VarPtr(buf(0)))
+    For i = 0 To cnt - 1
+        b = 4 + i * 4
+        If b + 4 > size Then Exit For
+        c.Add buf(b) & "." & buf(b + 1) & "." & buf(b + 2) & "." & buf(b + 3)
+    Next i
+Done:
+End Function
+
+Private Sub BuildSockaddrV4(ByRef sa() As Byte, ByVal ip As String, ByVal port As Long)
+    Dim parts() As String, i As Long
+    For i = 0 To 15
+        sa(i) = 0
+    Next i
+    parts = Split(ip, ".")
+    sa(0) = AF_INET
+    sa(2) = port \ 256: sa(3) = port Mod 256
+    For i = 0 To 3
+        sa(4 + i) = CByte(parts(i))
+    Next i
+End Sub
+
+' DNS query for d.c.b.a.in-addr.arpa PTR. Returns its length.
+Private Function BuildPtrQuery(ByRef q() As Byte, ByVal ip As String, ByVal id As Long) As Long
+    Dim parts() As String, lb As Variant, pos As Long, i As Long
+    parts = Split(ip, ".")
+    ReDim q(0 To 63)
+    q(0) = (id \ 256) And &HFF
+    q(1) = id And &HFF
+    q(2) = 1                                  ' recursion desired
+    q(5) = 1                                  ' one question
+    pos = 12
+    For Each lb In Array(parts(3), parts(2), parts(1), parts(0), "in-addr", "arpa")
+        q(pos) = Len(lb)
+        pos = pos + 1
+        For i = 1 To Len(lb)
+            q(pos) = Asc(Mid$(lb, i, 1))
+            pos = pos + 1
+        Next i
+    Next lb
+    q(pos) = 0                                ' end of name
+    q(pos + 2) = 12                           ' type PTR
+    q(pos + 4) = 1                            ' class IN
+    BuildPtrQuery = pos + 5
+End Function
+
+' True for a usable answer (including "no such name"); nm = PTR name or "".
+Private Function ParsePtrResponse(b() As Byte, ByVal n As Long, ByRef id As Long, ByRef nm As String) As Boolean
+    Dim rcode As Long, qd As Long, an As Long, pos As Long, i As Long, typ As Long, rdLen As Long
+    nm = ""
+    If n < 12 Then Exit Function
+    If (b(2) And &H80) = 0 Then Exit Function            ' not a response
+    id = CLng(b(0)) * 256 + b(1)
+    rcode = b(3) And &HF
+    If rcode = 3 Then ParsePtrResponse = True: Exit Function   ' NXDOMAIN: no PTR
+    If rcode <> 0 Then Exit Function                     ' server failure etc: try again
+    qd = CLng(b(4)) * 256 + b(5)
+    an = CLng(b(6)) * 256 + b(7)
+    pos = 12
+    For i = 1 To qd
+        pos = DnsSkipName(b, pos, n) + 4
+    Next i
+    For i = 1 To an
+        If pos >= n Then Exit For
+        pos = DnsSkipName(b, pos, n)
+        If pos + 10 > n Then Exit For
+        typ = CLng(b(pos)) * 256 + b(pos + 1)
+        rdLen = CLng(b(pos + 8)) * 256 + b(pos + 9)
+        If typ = 12 Then
+            nm = DnsReadName(b, pos + 10, n)
+            Exit For
+        End If
+        pos = pos + 10 + rdLen
+    Next i
+    ParsePtrResponse = True
+End Function
+
+Private Function DnsSkipName(b() As Byte, ByVal pos As Long, ByVal n As Long) As Long
+    Do While pos < n
+        If b(pos) = 0 Then DnsSkipName = pos + 1: Exit Function
+        If (b(pos) And &HC0) = &HC0 Then DnsSkipName = pos + 2: Exit Function
+        pos = pos + b(pos) + 1
+    Loop
+    DnsSkipName = n + 1
+End Function
+
+Private Function DnsReadName(b() As Byte, ByVal pos As Long, ByVal n As Long) As String
+    Dim s As String, L As Long, jumps As Long, i As Long
+    Do While pos < n And jumps < 32
+        L = b(pos)
+        If L = 0 Then Exit Do
+        If (L And &HC0) = &HC0 Then               ' compression pointer
+            If pos + 1 >= n Then Exit Do
+            pos = (L And &H3F) * 256 + b(pos + 1)
+            jumps = jumps + 1
+        Else
+            If pos + L >= n Then Exit Do
+            If Len(s) > 0 Then s = s & "."
+            For i = 1 To L
+                s = s & Chr$(b(pos + i))
+            Next i
+            pos = pos + L + 1
+        End If
+    Loop
+    DnsReadName = s
 End Function
 
 '==============================================================================
@@ -1406,7 +1803,8 @@ Private Function ScanOne(ByVal subnetText As String, ports() As Long, ByVal nPor
     Dim ptr As String, fwd As Collection, mac As String, openList As String, macStyle As Long
     Dim ws As Worksheet, lo As ListObject, rowRng As Range, result As String
     Dim nUp As Long, nMac As Long, nPtr As Long, nOpen As Long, nMismatch As Long, nFound As Long
-    Dim present As Boolean
+    Dim present As Boolean, ipCol As Collection, nameCol As Collection, seen As Object
+    Dim ptrMap As Object, fwdMap As Object
 
     info = ParseSubnet(subnetText)
     cidr = IPv4ToString(info.Network) & "/" & info.Prefix
@@ -1447,12 +1845,22 @@ Private Function ScanOne(ByVal subnetText As String, ports() As Long, ByVal nPor
     nCols = UBound(headers) + 1
     ReDim out(1 To n, 1 To nCols)
 
+    ' Reverse DNS for every address at once, then check each PTR name points back
+    Set ipCol = New Collection
     For i = 1 To n
-        If i Mod 8 = 1 Then
-            Application.StatusBar = APP_NAME & ": scanning " & cidr & " - DNS " & i & " of " & n & _
-                                    "   -   press Esc to stop"
-            DoEvents
-        End If
+        ipCol.Add ips(i)
+    Next i
+    Set ptrMap = ParallelPtr(ipCol, "scanning " & cidr & " - reverse DNS")
+    Set nameCol = New Collection
+    Set seen = CreateObject("Scripting.Dictionary")
+    seen.CompareMode = 1
+    For i = 1 To n
+        ptr = ptrMap(ips(i))
+        If Len(ptr) > 0 And Not seen.Exists(ptr) Then seen.Add ptr, True: nameCol.Add ptr
+    Next i
+    Set fwdMap = ParallelResolve(nameCol, "scanning " & cidr & " - forward check")
+
+    For i = 1 To n
         present = False
         out(i, 1) = ips(i)
         If up(i) Then
@@ -1473,11 +1881,11 @@ Private Function ScanOne(ByVal subnetText As String, ports() As Long, ByVal nPor
             out(i, 6) = MacVendor(mac)
         End If
 
-        ptr = PtrLookupDns(ips(i))
+        ptr = ptrMap(ips(i))
         If Len(ptr) > 0 Then
             nPtr = nPtr + 1
             out(i, 7) = ptr
-            Set fwd = LookupAddresses(ptr)
+            Set fwd = fwdMap(ptr)
             If InCollection(fwd, ips(i)) Then
                 out(i, 8) = "Yes"
             ElseIf fwd.Count = 0 Then
