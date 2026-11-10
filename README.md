@@ -6,9 +6,9 @@ a **NetTools** tab to the ribbon:
 
 | Button | What it does |
 |---|---|
-| **Check DNS** | For each IP address or hostname: forward lookup, reverse (PTR) lookup, a forward/reverse match check, and 4 pings |
+| **Check DNS** | For each IP address or hostname: forward lookup, reverse (PTR) lookup, a forward/reverse match check, and up to 4 pings |
 | **DNS Only** | The lookups without the ping (faster) |
-| **Ping Only** | 4 pings per host: status, replies, average latency, TTL |
+| **Ping Only** | Up to 4 pings per host: status, replies, average latency, TTL |
 | **Port Check** | Is TCP 22 / 443 / 3389 / ... open on each host? |
 | **Traceroute** | Hop-by-hop path to each host (3 probes per hop, like `tracert`) |
 | **Subnet Scan** | Every address in a subnet: ping, MAC address + vendor, reverse DNS, and optionally TCP ports. Hundreds at once |
@@ -46,7 +46,7 @@ sheets already has that name, the results go on `Subnets 2` (etc.) instead.
 | Reverse DNS (PTR) | `sw-core-01.corp.example.com` or `(no PTR record)` |
 | Fwd/Rev Match | `Yes`, `No PTR`, or `No - ...` with the reason |
 | Ping | `Up`, `Up - packet loss`, `Timed out`, `Destination host unreachable`, ... |
-| Replies | `4/4` |
+| Replies | `4/4`, or `0/2` for a host that missed 2 pings in a row and was marked down |
 | Avg Latency (ms) | `3` |
 | TTL | `254` |
 
@@ -151,12 +151,18 @@ and /32 is a single host. IPv4 only.
 
 ### Speed
 
-Lookups go through the Windows resolver, so the answers match what the PC
-itself sees (DNS suffixes, hosts file and so on). Ping uses WMI, so no
-command windows pop up. Each host gets 4 pings (`PING_COUNT`), and each
-ping waits up to 1 second (`PING_TIMEOUT_MS`), both set at the top of
-`src/NetTools.bas`. Hosts are checked one at a time: a host that is up
-takes a fraction of a second, a host that is down about 4 seconds.
+Forward lookups go through the Windows resolver, so the answers match what
+the PC itself sees (DNS suffixes, hosts file and so on). Reverse (PTR)
+lookups for IPv4 go straight to DNS, so an address with no PTR record
+doesn't stall while Windows tries NetBIOS.
+
+Check DNS and Ping Only look up each host first, then ping **all hosts at
+the same time**, in up to 4 rounds (`PING_COUNT`) of 1 second each
+(`PING_TIMEOUT_MS`). A host that misses **2 pings in a row**
+(`PING_DEAD_AFTER`) counts as down and gets no more pings. A list of 200
+hosts therefore pings in about 4 seconds, the same as a single host. All
+three settings are at the top of `src/NetTools.bas`. IPv6-only hosts are
+pinged one at a time.
 
 ### Worksheet functions
 
@@ -180,7 +186,7 @@ Also available in formulas, if you want results next to your own data:
 
 ### MSI (recommended)
 
-Double-click `NetTools-3.0.0.msi` and close Excel first if it's open. No admin
+Double-click `NetTools-3.1.0.msi` and close Excel first if it's open. No admin
 rights are needed. The installer puts `NetTools.xlam` in your Excel startup
 folder (`%APPDATA%\Microsoft\Excel\XLSTART`). Excel loads it every time it
 starts, and because that folder is one of Office's default trusted
@@ -188,7 +194,7 @@ locations, the macros run without a security prompt.
 
 - Uninstall: **Settings > Apps > NetTools for Excel**.
 - Upgrade: run a newer MSI. It replaces the old version.
-- Silent / Intune / SCCM: `msiexec /i NetTools-3.0.0.msi /qn`. This is a
+- Silent / Intune / SCCM: `msiexec /i NetTools-3.1.0.msi /qn`. This is a
   **per-user** MSI, so deploy it in the *user* context.
 
 If your company uses Group Policy to turn off trusted locations or block

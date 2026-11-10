@@ -36,8 +36,9 @@ Option Explicit
 ' ---- Settings ----------------------------------------------------------------
 Private Const PING_COUNT As Long = 4             ' echo requests per host (like Windows ping)
 Private Const PING_TIMEOUT_MS As Long = 1000     ' per echo request
+Private Const PING_DEAD_AFTER As Long = 2        ' stop pinging a host after this many misses in a row
 Private Const APP_NAME As String = "NetTools"
-Private Const APP_VERSION As String = "3.0.0"
+Private Const APP_VERSION As String = "3.1.0"
 
 ' ---- Result column headers ---------------------------------------------------
 Private Const H_HOST As String = "Host / IP"
@@ -275,7 +276,8 @@ Public Sub NT_OnAbout(control As IRibbonControl)
         "   =NT_SUBNET(A2, ""network"")  =NT_INSUBNET(B2, A2)" & vbCrLf & _
         "   =NT_MAC(A2, ""cisco"")  =NT_VENDOR(A2)" & vbCrLf & vbCrLf & _
         "MAC vendor list: " & IIf(OuiList().Count > 0, Format$(OuiList().Count, "#,##0") & " vendors", "not installed") & vbCrLf & _
-        "Ping: " & PING_COUNT & " echo requests per host, " & PING_TIMEOUT_MS & " ms timeout each.", _
+        "Ping: up to " & PING_COUNT & " echo requests per host (" & PING_TIMEOUT_MS & " ms timeout), " & _
+        "all hosts at once; a host that misses " & PING_DEAD_AFTER & " in a row counts as down.", _
         vbInformation, "About " & APP_NAME
 End Sub
 
@@ -320,7 +322,7 @@ Private Sub RunChecks(ByVal doDns As Boolean, ByVal doPing As Boolean)
     Dim headers As Variant, title As String, rowRng As Range
     Dim i As Long, total As Long, done As Long, host As String, res As HostResult
     Dim nUp As Long, nDown As Long, nLoss As Long, nDnsFail As Long, nMismatch As Long
-    Dim t0 As Double, wsaOk As Boolean, msg As String
+    Dim t0 As Double, wsaOk As Boolean, msg As String, results() As HostResult
 
     Set items = GetInputList("Hostnames or IP addresses to check, separated by commas or spaces:", False, srcDesc)
     If items Is Nothing Then Exit Sub
@@ -348,23 +350,39 @@ Private Sub RunChecks(ByVal doDns As Boolean, ByVal doPing As Boolean)
         GoTo Cleanup
     End If
 
+    ' 1. Look up every host (rows appear as they're done)
+    ReDim results(1 To total)
     For i = 1 To total
         host = items(i)
-        Application.StatusBar = APP_NAME & ": " & host & "  (" & i & " of " & total & ")   -   press Esc to stop"
-
-        res = CheckHost(host, doDns, doPing)
+        Application.StatusBar = APP_NAME & ": " & IIf(doDns, "DNS ", "resolving ") & host & _
+                                "  (" & i & " of " & total & ")   -   press Esc to stop"
+        results(i) = CheckHost(host, doDns, False)
         Set rowRng = lo.DataBodyRange.Rows(i)
-        rowRng.Value = ResultToRow(host, res, doDns, doPing)
-        ColourRow rowRng, headers, res
+        rowRng.Value = ResultToRow(host, results(i), doDns, doPing)
+        If Not doPing Then ColourRow rowRng, headers, results(i)
         done = i
-
-        If res.DnsFailed Then nDnsFail = nDnsFail + 1
-        If doDns And Left$(res.Match, 2) = "No" Then nMismatch = nMismatch + 1
-        If doPing Then
-            If res.PingUp Then nUp = nUp + 1 Else nDown = nDown + 1
-            If res.PingLoss Then nLoss = nLoss + 1
-        End If
         DoEvents
+    Next i
+
+    ' 2. Ping them all at once
+    If doPing Then
+        PingAll results, total
+        Application.ScreenUpdating = False
+        For i = 1 To total
+            Set rowRng = lo.DataBodyRange.Rows(i)
+            rowRng.Value = ResultToRow(CStr(items(i)), results(i), doDns, doPing)
+            ColourRow rowRng, headers, results(i)
+        Next i
+        Application.ScreenUpdating = True
+    End If
+
+    For i = 1 To total
+        If results(i).DnsFailed Then nDnsFail = nDnsFail + 1
+        If doDns And Left$(results(i).Match, 2) = "No" Then nMismatch = nMismatch + 1
+        If doPing Then
+            If results(i).PingUp Then nUp = nUp + 1 Else nDown = nDown + 1
+            If results(i).PingLoss Then nLoss = nLoss + 1
+        End If
     Next i
 
     FinishTable lo, done
@@ -385,6 +403,7 @@ Private Sub RunChecks(ByVal doDns As Boolean, ByVal doPing As Boolean)
 
 Handler:
     Application.StatusBar = False
+    Application.ScreenUpdating = True
     If Err.Number = 18 Then
         If Not lo Is Nothing Then FinishTable lo, done
         MsgBox "Stopped after " & done & " of " & total & " host(s).", vbInformation, APP_NAME
@@ -701,7 +720,7 @@ End Sub
 '==============================================================================
 Private Function CheckHost(ByVal host As String, ByVal doDns As Boolean, ByVal doPing As Boolean) As HostResult
     Dim res As HostResult, addrs As Collection, fwd As Collection, canonical As String
-    Dim lat As Variant, ttl As Variant, received As Long
+    Dim lat As Variant, ttl As Variant, received As Long, sent As Long
 
     res.Latency = Empty
     res.Ttl = Empty
@@ -713,7 +732,7 @@ Private Function CheckHost(ByVal host As String, ByVal doDns As Boolean, ByVal d
         res.Addresses = canonical
         res.FirstAddr = canonical
         If doDns Then
-            res.Ptr = ReverseLookup(canonical)
+            res.Ptr = FastPtr(canonical)
             If Len(res.Ptr) = 0 Then
                 res.Ptr = "(no PTR record)"
                 res.Match = "No PTR"
@@ -746,7 +765,7 @@ Private Function CheckHost(ByVal host As String, ByVal doDns As Boolean, ByVal d
         res.Addresses = JoinCollection(addrs)
         res.FirstAddr = addrs(1)
         If doDns Then
-            res.Ptr = ReverseLookup(res.FirstAddr)
+            res.Ptr = FastPtr(res.FirstAddr)
             If Len(res.Ptr) = 0 Then
                 res.Ptr = "(no PTR record)"
                 res.Match = "No PTR"
@@ -759,10 +778,10 @@ Private Function CheckHost(ByVal host As String, ByVal doDns As Boolean, ByVal d
     End If
 
     If doPing Then
-        res.PingStatus = PingHost(res.FirstAddr, lat, ttl, received)
-        res.Replies = received & "/" & PING_COUNT
+        res.PingStatus = PingHost(res.FirstAddr, lat, ttl, received, sent)
+        res.Replies = received & "/" & sent
         res.PingUp = (received > 0)
-        res.PingLoss = (received > 0 And received < PING_COUNT)
+        res.PingLoss = (received > 0 And received < sent)
         res.Latency = lat
         res.Ttl = ttl
     End If
@@ -915,19 +934,97 @@ Private Function JoinCollection(ByVal c As Collection) As String
 End Function
 
 '==============================================================================
-' Ping (WMI Win32_PingStatus)
+' Ping
 '==============================================================================
+' Pings every resolved host at the same time, in rounds of one ping each
+' (like Windows ping's 4, but all hosts together - so 200 hosts take about as
+' long as one). A host that misses PING_DEAD_AFTER pings in a row is down and
+' gets no more. IPv6-only hosts fall back to WMI, one at a time.
+Private Sub PingAll(results() As HostResult, ByVal n As Long)
+    Dim ips() As String, todo() As Boolean, up() As Boolean, st() As Long, rtt() As Long, ttl() As Long
+    Dim v4() As Boolean, sent() As Long, recv() As Long, misses() As Long, lastSt() As Long
+    Dim rttSum() As Double, lastTtl() As Long, i As Long, pass As Long, anyLeft As Boolean
+    Dim lat As Variant, tl As Variant, r As Long, sn As Long
+
+    ReDim ips(1 To n), todo(1 To n), up(1 To n), st(1 To n), rtt(1 To n), ttl(1 To n)
+    ReDim v4(1 To n), sent(1 To n), recv(1 To n), misses(1 To n), lastSt(1 To n), rttSum(1 To n), lastTtl(1 To n)
+    For i = 1 To n
+        ips(i) = "0.0.0.0"
+        If Not results(i).DnsFailed And Len(results(i).FirstAddr) > 0 And InStr(results(i).FirstAddr, ":") = 0 _
+           And InStr(results(i).FirstAddr, "(") = 0 Then
+            v4(i) = True
+            ips(i) = results(i).FirstAddr
+        End If
+    Next i
+
+    For pass = 1 To PING_COUNT
+        anyLeft = False
+        For i = 1 To n
+            todo(i) = v4(i) And misses(i) < PING_DEAD_AFTER
+            up(i) = False: st(i) = 0
+            If todo(i) Then anyLeft = True
+        Next i
+        If Not anyLeft Then Exit For
+        PingMany ips, todo, PING_TIMEOUT_MS, up, st, rtt, ttl, "ping round " & pass & " of " & PING_COUNT
+        For i = 1 To n
+            If todo(i) Then
+                sent(i) = sent(i) + 1
+                If up(i) Then
+                    recv(i) = recv(i) + 1
+                    rttSum(i) = rttSum(i) + rtt(i)
+                    lastTtl(i) = ttl(i)
+                    misses(i) = 0
+                Else
+                    misses(i) = misses(i) + 1
+                    lastSt(i) = st(i)
+                End If
+            End If
+        Next i
+    Next pass
+
+    For i = 1 To n
+        If v4(i) Then
+            results(i).Replies = recv(i) & "/" & sent(i)
+            results(i).PingUp = (recv(i) > 0)
+            results(i).PingLoss = (recv(i) > 0 And recv(i) < sent(i))
+            If recv(i) = 0 Then
+                If lastSt(i) = 0 Then lastSt(i) = IP_REQ_TIMED_OUT
+                results(i).PingStatus = PingStatusText(lastSt(i))
+            Else
+                results(i).Latency = Round(rttSum(i) / recv(i), 0)
+                results(i).Ttl = lastTtl(i)
+                If recv(i) = sent(i) Then results(i).PingStatus = "Up" Else results(i).PingStatus = "Up - packet loss"
+            End If
+        ElseIf Not results(i).DnsFailed And InStr(results(i).FirstAddr, ":") > 0 Then
+            Application.StatusBar = APP_NAME & ": ping " & results(i).FirstAddr & " (IPv6)"
+            results(i).PingStatus = PingHost(results(i).FirstAddr, lat, tl, r, sn)
+            results(i).Replies = r & "/" & sn
+            results(i).PingUp = (r > 0)
+            results(i).PingLoss = (r > 0 And r < sn)
+            results(i).Latency = lat
+            results(i).Ttl = tl
+        End If
+    Next i
+End Sub
+
+' Reverse lookup: straight from DNS for IPv4 (quick even with no record),
+' the Windows resolver for IPv6.
+Private Function FastPtr(ByVal ip As String) As String
+    If InStr(ip, ":") = 0 Then FastPtr = PtrLookupDns(ip) Else FastPtr = ReverseLookup(ip)
+End Function
+
 ' Sends PING_COUNT echo requests (one at a time, like Windows ping).
 ' Returns "Up", "Up - packet loss", or the failure (e.g. "Timed out").
 ' latency = average round trip of the replies (ms), ttl = TTL of the last reply,
 ' received = number of replies.
 Private Function PingHost(ByVal addr As String, ByRef latency As Variant, ByRef ttl As Variant, _
-        ByRef received As Long) As String
+        ByRef received As Long, Optional ByRef sent As Long) As String
     Dim pings As Object, reply As Object, code As Variant
-    Dim i As Long, totalMs As Double, lastFailure As String
+    Dim i As Long, totalMs As Double, lastFailure As String, before As Long, misses As Long
     latency = Empty
     ttl = Empty
     received = 0
+    sent = 0
     lastFailure = "No response"
     On Error GoTo Fail
 
@@ -936,6 +1033,8 @@ Private Function PingHost(ByVal addr As String, ByRef latency As Variant, ByRef 
     End If
 
     For i = 1 To PING_COUNT
+        before = received
+        sent = i
         Set pings = mWmi.ExecQuery( _
             "SELECT StatusCode, ResponseTime, ResponseTimeToLive FROM Win32_PingStatus " & _
             "WHERE Address='" & Replace(addr, "'", "") & "' AND Timeout=" & PING_TIMEOUT_MS)
@@ -952,13 +1051,15 @@ Private Function PingHost(ByVal addr As String, ByRef latency As Variant, ByRef 
             End If
         Next reply
         DoEvents        ' keeps Excel responsive and lets Esc stop the run
+        If received > before Then misses = 0 Else misses = misses + 1
+        If misses >= PING_DEAD_AFTER Then Exit For      ' counts as down - stop here
     Next i
 
     If received = 0 Then
         PingHost = lastFailure
     Else
         latency = Round(totalMs / received, 0)
-        If received = PING_COUNT Then PingHost = "Up" Else PingHost = "Up - packet loss"
+        If received = sent Then PingHost = "Up" Else PingHost = "Up - packet loss"
     End If
     Exit Function
 
@@ -2256,7 +2357,7 @@ End Function
 ' =NT_PING("server1")  ->  "Up (4/4, 3 ms)" / "Timed out" / "Not resolved"
 Public Function NT_PING(ByVal host As String) As String
     Dim ip As String, addrs As Collection, lat As Variant, ttl As Variant, status As String
-    Dim received As Long
+    Dim received As Long, sent As Long
     host = CleanHost(host)
     If Len(host) = 0 Then Exit Function
     If Not WsaInit() Then NT_PING = "#WSA error": Exit Function
@@ -2267,9 +2368,9 @@ Public Function NT_PING(ByVal host As String) As String
     End If
     WSACleanup
     If Len(ip) = 0 Then NT_PING = "Not resolved": Exit Function
-    status = PingHost(ip, lat, ttl, received)
+    status = PingHost(ip, lat, ttl, received, sent)
     If received > 0 Then
-        NT_PING = status & " (" & received & "/" & PING_COUNT & ", " & lat & " ms)"
+        NT_PING = status & " (" & received & "/" & sent & ", " & lat & " ms)"
     Else
         NT_PING = status
     End If
