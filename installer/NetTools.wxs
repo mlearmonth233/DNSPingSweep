@@ -10,6 +10,7 @@
 
   Built by ..\build.ps1 -Msi, which passes:
     -d Version=x.y.z  -d XlamPath=..\dist\NetTools.xlam  -d OuiPath=..\dist\oui.txt
+    -d PlinkPath=..\dist\plink.exe  -d HasPlink=1|0
 
   oui.txt (MAC vendor list) goes to %APPDATA%\NetTools - not XLSTART,
   because Excel would try to open every file in XLSTART.
@@ -39,6 +40,14 @@
                          Name="OuiVersion" Type="string" Value="$(var.Version)" KeyPath="yes" />
           <RemoveFolder Id="RemoveNetToolsDataDir" Directory="NetToolsDataDir" On="uninstall" />
         </Component>
+<?if $(var.HasPlink) = "1" ?>
+        <!-- PuTTY plink.exe, used by SSH Logs -->
+        <Component Id="NetToolsPlink" Guid="9E3C1D7A-4B2F-4F6E-8A51-3C7D2B9E0F18">
+          <File Id="PlinkExe" Name="plink.exe" Source="$(var.PlinkPath)" />
+          <RegistryValue Root="HKCU" Key="Software\NetTools\ExcelAddin"
+                         Name="PlinkVersion" Type="string" Value="$(var.Version)" KeyPath="yes" />
+        </Component>
+<?endif?>
       </Directory>
       <Directory Id="MicrosoftDir" Name="Microsoft">
         <Directory Id="ExcelDir" Name="Excel">
@@ -63,6 +72,9 @@
     <Feature Id="Main" Title="NetTools for Excel">
       <ComponentRef Id="NetToolsAddin" />
       <ComponentRef Id="NetToolsOui" />
+<?if $(var.HasPlink) = "1" ?>
+      <ComponentRef Id="NetToolsPlink" />
+<?endif?>
     </Feature>
   </Package>
 </Wix>

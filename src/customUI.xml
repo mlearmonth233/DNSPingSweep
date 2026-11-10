@@ -76,6 +76,16 @@
                   supertip="Reformats the selected MAC addresses as xxxx.xxxx.xxxx or XX:XX:XX:XX:XX:XX (you choose) and looks up the vendor. Results go on the 'MAC Addresses' sheet." />
         </group>
 
+        <group id="grpSsh" label="SSH">
+          <button id="btnSshLogs"
+                  label="SSH Logs"
+                  size="large"
+                  imageMso="ViewCode"
+                  onAction="NT_OnSshLogs"
+                  screentip="SSH Logs"
+                  supertip="SSH into the selected Cisco IOS / IOS-XE / 9800 or AireOS devices with your username and password, run commands such as show logging, and put each device's output on its own sheet (also saved under Documents\NetTools\SSH Logs). The password is never saved." />
+        </group>
+
         <group id="grpTools" label="Help">
           <button id="btnAbout"
                   label="About"

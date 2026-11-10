@@ -11,6 +11,9 @@ Attribute VB_Name = "NetTools"
 '             TCP ports for every address in a subnet - hundreds at once.
 ' Port Check: is TCP 22/443/3389/... open on each host?
 ' MAC Format: xxxx.xxxx.xxxx or XX:XX:XX:XX:XX:XX, plus the vendor.
+' SSH Logs  : SSH (username + password, via PuTTY plink.exe) to Cisco IOS /
+'             IOS-XE / 9800 or AireOS devices, run commands such as
+'             "show logging", one sheet per device.
 '
 ' Results always go on a NEW sheet as an Excel table - the data you select
 ' is never changed.
@@ -38,7 +41,7 @@ Private Const PING_COUNT As Long = 4             ' echo requests per host (like 
 Private Const PING_TIMEOUT_MS As Long = 1000     ' per echo request
 Private Const PING_DEAD_AFTER As Long = 2        ' stop pinging a host after this many misses in a row
 Private Const APP_NAME As String = "NetTools"
-Private Const APP_VERSION As String = "3.1.0"
+Private Const APP_VERSION As String = "3.2.0"
 
 ' ---- Result column headers ---------------------------------------------------
 Private Const H_HOST As String = "Host / IP"
@@ -191,9 +194,39 @@ Private Declare PtrSafe Function getsockopt Lib "ws2_32.dll" (ByVal s As LongPtr
     ByVal optname As Long, ByRef optval As Long, ByRef optlen As Long) As Long
 Private Declare PtrSafe Function WSAGetLastError Lib "ws2_32.dll" () As Long
 
+' ---- SSH (plink.exe child processes) ------------------------------------------
+Private Const SSH_PARALLEL As Long = 8              ' devices at once
+Private Const SSH_TIMEOUT_S As Long = 120           ' per device, whole collection
+Private Const SSH_CONNECT_TIMEOUT_S As Long = 30    ' first-connect (host key) step
+Private Const SSH_DEFAULT_COMMANDS_IOS As String = "show logging"
+Private Const SSH_DEFAULT_COMMANDS_AIREOS As String = "show msglog"
+Private Const SSH_IOS As Long = 1
+Private Const SSH_AIREOS As Long = 2
+Private Const SYNCHRONIZE As Long = &H100000
+Private Const PROCESS_QUERY_LIMITED_INFORMATION As Long = &H1000
+Private Declare PtrSafe Function OpenProcess Lib "kernel32" (ByVal dwDesiredAccess As Long, _
+    ByVal bInheritHandle As Long, ByVal dwProcessId As Long) As LongPtr
+Private Declare PtrSafe Function WaitForSingleObject Lib "kernel32" (ByVal hHandle As LongPtr, _
+    ByVal dwMilliseconds As Long) As Long
+Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+
 Private mWmi As Object
 Private mOui As Object          ' MAC vendor list (OUI -> vendor), loaded on first use
 Private mOuiTried As Boolean
+
+' One device in an SSH Logs run
+Private Type SshJob
+    Host As String
+    Stage As Long           ' 0 waiting, 1 first connect (accept host key), 2 collecting, 3 done
+    Pid As Long
+    hProc As LongPtr
+    Started As Double
+    BaseName As String      ' temp file prefix
+    Status As String
+    Output As String
+    SavedPath As String
+    Ok As Boolean
+End Type
 
 ' Result of parsing/calculating one IPv4 subnet (addresses as 0..2^32-1)
 Private Type SubnetInfo
@@ -248,6 +281,10 @@ Public Sub NT_OnMacFormat(control As IRibbonControl)
     RunMacFormat
 End Sub
 
+Public Sub NT_OnSshLogs(control As IRibbonControl)
+    RunSshLogs
+End Sub
+
 Public Sub NT_OnTraceroute(control As IRibbonControl)
     RunTraceroute
 End Sub
@@ -266,7 +303,7 @@ Public Sub NT_OnAbout(control As IRibbonControl)
         "   (select just the first cell to run to the end of the list)," & vbCrLf & _
         "   or select an empty cell to type them in." & vbCrLf & _
         "2. Click a button: Check DNS, DNS Only, Ping Only, Port Check," & vbCrLf & _
-        "   Traceroute, Subnet Scan, Subnet Calc or MAC Format." & vbCrLf & _
+        "   Traceroute, Subnet Scan, Subnet Calc, MAC Format or SSH Logs." & vbCrLf & _
         "3. Results go on their own sheet as a table (rerunning overwrites" & vbCrLf & _
         "   that sheet) - the data you selected is never changed." & vbCrLf & _
         "   Press Esc to stop a long run." & vbCrLf & vbCrLf & _
@@ -275,6 +312,7 @@ Public Sub NT_OnAbout(control As IRibbonControl)
         "Worksheet functions: =NT_RESOLVE(A2)  =NT_PTR(A2)  =NT_PING(A2)" & vbCrLf & _
         "   =NT_SUBNET(A2, ""network"")  =NT_INSUBNET(B2, A2)" & vbCrLf & _
         "   =NT_MAC(A2, ""cisco"")  =NT_VENDOR(A2)" & vbCrLf & vbCrLf & _
+        "SSH client (plink.exe): " & IIf(Len(FindPlink()) > 0, FindPlink(), "not found") & vbCrLf & _
         "MAC vendor list: " & IIf(OuiList().Count > 0, Format$(OuiList().Count, "#,##0") & " vendors", "not installed") & vbCrLf & _
         "Ping: up to " & PING_COUNT & " echo requests per host (" & PING_TIMEOUT_MS & " ms timeout), " & _
         "all hosts at once; a host that misses " & PING_DEAD_AFTER & " in a row counts as down.", _
@@ -300,6 +338,10 @@ End Sub
 
 Public Sub NetTools_MacFormat()
     RunMacFormat
+End Sub
+
+Public Sub NetTools_SshLogs()
+    RunSshLogs
 End Sub
 
 Public Sub NetTools_Traceroute()
@@ -2163,6 +2205,447 @@ Private Function ReadStringA(ByVal p As LongPtr) As String
     ReDim b(0 To n - 1)
     CopyMemory b(0), p, n
     ReadStringA = StrConv(b, vbUnicode)
+End Function
+
+'==============================================================================
+' SSH logs - drives PuTTY's plink.exe (installed by the MSI)
+'==============================================================================
+Private Sub RunSshLogs()
+    Dim items As Collection, srcDesc As String, plink As String, user As String, pw As String
+    Dim cmds As String, jobs() As SshJob, n As Long, i As Long, running As Long, nDone As Long
+    Dim tmpDir As String, logDir As String, cmdFile As String, pwFile As String, part As Variant, f As Integer
+    Dim nOk As Long, t0 As Double, summary As String, devType As Long, defCmds As String
+
+    plink = FindPlink()
+    If Len(plink) = 0 Then
+        MsgBox "SSH Logs needs PuTTY's plink.exe, which wasn't found." & vbCrLf & vbCrLf & _
+               "Reinstall NetTools from an MSI built while online (it includes plink.exe), " & _
+               "or install PuTTY.", vbExclamation, APP_NAME
+        Exit Sub
+    End If
+
+    Set items = GetInputList("Devices to collect from (hostnames or IPs), separated by commas or spaces:", False, srcDesc)
+    If items Is Nothing Then Exit Sub
+    devType = AskSshDeviceType()
+    If devType = 0 Then Exit Sub
+    If Not SshAskLogin(user, pw) Then Exit Sub
+
+    defCmds = IIf(devType = SSH_AIREOS, SSH_DEFAULT_COMMANDS_AIREOS, SSH_DEFAULT_COMMANDS_IOS)
+    cmds = InputBox("Commands to run on each device, separated by semicolons." & vbCrLf & vbCrLf & _
+                    "Example:  " & IIf(devType = SSH_AIREOS, "show msglog; show traplog", "show logging; show version") & _
+                    vbCrLf & vbCrLf & "(" & IIf(devType = SSH_AIREOS, "'config paging disable'", "'terminal length 0'") & _
+                    " is sent first automatically.)", APP_NAME & " - SSH commands", _
+                    GetSetting(APP_NAME, "SSH", "Commands" & devType, defCmds))
+    If StrPtr(cmds) = 0 Or Len(Trim$(cmds)) = 0 Then pw = "": Exit Sub
+    SaveSetting APP_NAME, "SSH", "Commands" & devType, cmds
+
+    n = items.Count
+    ReDim jobs(1 To n)
+    If n > 20 Then
+        If MsgBox("Collect from " & n & " devices (" & SSH_PARALLEL & " at a time)?", _
+                  vbOKCancel + vbQuestion, APP_NAME) <> vbOK Then pw = "": Exit Sub
+    End If
+
+    ' Folders: temp files, and a permanent copy of every log
+    tmpDir = Environ$("TEMP") & "\NetTools-ssh"
+    MakeFolder tmpDir
+    logDir = CreateObject("WScript.Shell").SpecialFolders("MyDocuments") & "\NetTools"
+    MakeFolder logDir
+    logDir = logDir & "\SSH Logs"
+    MakeFolder logDir
+
+    Application.EnableCancelKey = xlErrorHandler
+    On Error GoTo Handler
+
+    ' Password for plink (-pwfile) - deleted as soon as the run ends
+    pwFile = tmpDir & "\pw.txt"
+    f = FreeFile
+    Open pwFile For Output As #f
+    Print #f, pw
+    Close #f
+
+    ' What gets typed into each device
+    cmdFile = tmpDir & "\commands.txt"
+    f = FreeFile
+    Open cmdFile For Output As #f
+    If devType = SSH_AIREOS Then
+        Print #f, user                ' AireOS asks for User: / Password: again inside the session
+        Print #f, pw
+        Print #f, "config paging disable"
+    Else
+        Print #f, "terminal length 0"
+    End If
+    For Each part In Split(cmds, ";")
+        If Len(Trim$(CStr(part))) > 0 Then Print #f, Trim$(CStr(part))
+    Next part
+    If devType = SSH_AIREOS Then
+        Print #f, "logout"
+        Print #f, "N"                 ' "save changes?" - no
+    Else
+        Print #f, "exit"
+    End If
+    Close #f
+    pw = ""
+
+    For i = 1 To n
+        jobs(i).Host = items(i)
+        jobs(i).BaseName = tmpDir & "\job" & i
+        If Not IsSafeToken(jobs(i).Host, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_:") Then
+            jobs(i).Status = "Not a valid host name"
+            jobs(i).Stage = 3
+        End If
+    Next i
+
+    t0 = Timer
+    Do
+        ' Check on the running ones
+        running = 0: nDone = 0
+        For i = 1 To n
+            Select Case jobs(i).Stage
+                Case 1, 2
+                    If SshExited(jobs(i)) Then
+                        SshNextStep jobs(i), plink, user, pwFile, cmdFile, logDir
+                        If jobs(i).Stage <> 3 Then running = running + 1
+                    ElseIf ElapsedSeconds(jobs(i).Started) > IIf(jobs(i).Stage = 1, SSH_CONNECT_TIMEOUT_S, SSH_TIMEOUT_S) Then
+                        SshKill jobs(i)
+                        jobs(i).Status = "Timed out after " & IIf(jobs(i).Stage = 1, SSH_CONNECT_TIMEOUT_S, SSH_TIMEOUT_S) & " s"
+                        jobs(i).Stage = 3
+                    Else
+                        running = running + 1
+                    End If
+            End Select
+            If jobs(i).Stage = 3 Then nDone = nDone + 1
+        Next i
+        If nDone = n Then Exit Do
+
+        ' Start more, up to SSH_PARALLEL
+        For i = 1 To n
+            If running >= SSH_PARALLEL Then Exit For
+            If jobs(i).Stage = 0 Then
+                If SshHostKeyKnown(jobs(i).Host) Then
+                    SshStart jobs(i), 2, plink, user, pwFile, cmdFile
+                Else
+                    SshStart jobs(i), 1, plink, user, pwFile, cmdFile    ' new device: accept its key first
+                End If
+                running = running + 1
+            End If
+        Next i
+
+        Application.StatusBar = APP_NAME & ": SSH - " & nDone & " of " & n & " done, " & running & _
+                                " running   -   press Esc to stop"
+        DoEvents
+        Sleep 200
+    Loop
+
+    ' The password and commands files aren't needed any more
+    SshDeleteSecrets pwFile, cmdFile
+
+    ' Results: a summary sheet, then one sheet per device that answered
+    Application.StatusBar = APP_NAME & ": writing SSH results"
+    WriteSshResults jobs, n, cmds, logDir, nOk
+    For i = 1 To n
+        If Not jobs(i).Ok Then summary = summary & vbCrLf & "   " & jobs(i).Host & ": " & jobs(i).Status
+    Next i
+    Application.StatusBar = False
+    MsgBox nOk & " of " & n & " device(s) collected in " & Format$(ElapsedSeconds(t0), "0") & " s." & _
+           IIf(Len(summary) > 0, vbCrLf & vbCrLf & "Problems:" & summary, "") & vbCrLf & vbCrLf & _
+           "Logs are also saved in:" & vbCrLf & logDir, IIf(nOk = n, vbInformation, vbExclamation), APP_NAME
+    GoTo Cleanup
+
+Handler:
+    For i = 1 To n
+        If jobs(i).Stage = 1 Or jobs(i).Stage = 2 Then SshKill jobs(i)
+    Next i
+    Application.StatusBar = False
+    Application.ScreenUpdating = True
+    If Err.Number = 18 Then
+        MsgBox "SSH collection stopped.", vbInformation, APP_NAME
+    Else
+        MsgBox "Error " & Err.Number & ": " & Err.Description, vbCritical, APP_NAME
+    End If
+
+Cleanup:
+    On Error Resume Next
+    pw = ""
+    SshDeleteSecrets pwFile, cmdFile
+    Kill tmpDir & "\job*.*"
+    Application.StatusBar = False
+    Application.EnableCancelKey = xlInterrupt
+End Sub
+
+Private Sub SshDeleteSecrets(ByVal pwFile As String, ByVal cmdFile As String)
+    On Error Resume Next
+    If Len(pwFile) > 0 Then
+        If Len(Dir$(pwFile)) > 0 Then Kill pwFile
+    End If
+    If Len(cmdFile) > 0 Then
+        If Len(Dir$(cmdFile)) > 0 Then Kill cmdFile
+    End If
+End Sub
+
+' Which kind of device (remembered). 0 = cancelled.
+Private Function AskSshDeviceType() As Long
+    Dim answer As String
+    answer = InputBox("What kind of devices?" & vbCrLf & vbCrLf & _
+                      "   1  =  Cisco IOS / IOS-XE  (switches, routers, Catalyst 9800 WLC)" & vbCrLf & vbCrLf & _
+                      "   2  =  Cisco AireOS WLC" & vbCrLf & vbCrLf & _
+                      "Type 1 or 2:", APP_NAME & " - SSH device type", _
+                      GetSetting(APP_NAME, "SSH", "DeviceType", CStr(SSH_IOS)))
+    If StrPtr(answer) = 0 Then Exit Function
+    Select Case Trim$(answer)
+        Case "1": AskSshDeviceType = SSH_IOS
+        Case "2": AskSshDeviceType = SSH_AIREOS
+        Case Else
+            MsgBox "Please type 1 or 2.", vbExclamation, APP_NAME
+            Exit Function
+    End Select
+    SaveSetting APP_NAME, "SSH", "DeviceType", CStr(AskSshDeviceType)
+End Function
+
+' Starts plink for one device, hidden. Stage 1 = first connection to a device
+' (answers "y" to store its host key, runs "exit"); stage 2 = run the commands.
+Private Sub SshStart(ByRef job As SshJob, ByVal stage As Long, ByVal plink As String, _
+        ByVal user As String, ByVal pwFile As String, ByVal cmdFile As String)
+    Dim args As String, inner As String
+    args = "-ssh -l " & Q(user) & " -pwfile " & Q(pwFile) & " " & job.Host
+    If stage = 1 Then
+        inner = "echo y| " & Q(plink) & " " & args & " exit > " & Q(job.BaseName & "_k.out") & _
+                " 2> " & Q(job.BaseName & "_k.err")
+    Else
+        inner = Q(plink) & " -batch " & args & " < " & Q(cmdFile) & " > " & Q(job.BaseName & ".out") & _
+                " 2> " & Q(job.BaseName & ".err")
+    End If
+    job.Pid = Shell("cmd.exe /c """ & inner & """", vbHide)
+    job.hProc = OpenProcess(SYNCHRONIZE Or PROCESS_QUERY_LIMITED_INFORMATION, 0, job.Pid)
+    job.Started = Timer
+    job.Stage = stage
+End Sub
+
+Private Function SshExited(ByRef job As SshJob) As Boolean
+    If job.hProc = 0 Then
+        SshExited = True              ' already gone before we could watch it
+    Else
+        SshExited = (WaitForSingleObject(job.hProc, 0) = 0)
+    End If
+End Function
+
+Private Sub SshKill(ByRef job As SshJob)
+    On Error Resume Next
+    If job.Pid <> 0 Then Shell "taskkill.exe /F /T /PID " & job.Pid, vbHide
+    If job.hProc <> 0 Then CloseHandle job.hProc
+    job.hProc = 0
+End Sub
+
+' Called when a plink run ends: move to the next stage or record the result.
+Private Sub SshNextStep(ByRef job As SshJob, ByVal plink As String, ByVal user As String, _
+        ByVal pwFile As String, ByVal cmdFile As String, ByVal logDir As String)
+    Dim errText As String
+    If job.hProc <> 0 Then CloseHandle job.hProc
+    job.hProc = 0
+
+    If job.Stage = 1 Then
+        ' Can't reach it at all? Stop here; otherwise collect (host key is now stored)
+        errText = LCase$(ReadTextFile(job.BaseName & "_k.err"))
+        If InStr(errText, "network error") > 0 Or InStr(errText, "host does not exist") > 0 Or _
+           InStr(errText, "unable to open connection") > 0 Then
+            job.Status = SshClassify("", ReadTextFile(job.BaseName & "_k.err"), job.Ok)
+            job.Stage = 3
+        Else
+            SshStart job, 2, plink, user, pwFile, cmdFile
+        End If
+        Exit Sub
+    End If
+
+    job.Output = ReadTextFile(job.BaseName & ".out")
+    job.Status = SshClassify(job.Output, ReadTextFile(job.BaseName & ".err"), job.Ok)
+    If job.Ok Then
+        job.SavedPath = logDir & "\" & Replace(job.Host, ":", "_") & " " & Format$(Now, "yyyy-mm-dd hhnnss") & ".txt"
+        On Error Resume Next
+        FileCopy job.BaseName & ".out", job.SavedPath
+        If Err.Number <> 0 Then job.SavedPath = ""
+        On Error GoTo 0
+    End If
+    job.Stage = 3
+End Sub
+
+' Turns plink's output/errors into a short status. ok = True if we got output.
+Private Function SshClassify(ByVal outText As String, ByVal errText As String, ByRef ok As Boolean) As String
+    Dim e As String
+    e = LCase$(errText)
+    ok = False
+    If InStr(e, "potential security breach") > 0 Or InStr(e, "host key does not match") > 0 Then
+        SshClassify = "HOST KEY CHANGED - not connected. Check the device; if the change is expected, " & _
+                      "remove its old key in PuTTY (or the registry) and run again."
+    ElseIf InStr(e, "host key is not cached") > 0 Or InStr(e, "cannot confirm a host key") > 0 Then
+        SshClassify = "New host key could not be stored - run again"
+    ElseIf InStr(e, "unknown option") > 0 Or InStr(e, "unrecognised option") > 0 Then
+        SshClassify = "plink.exe is too old - NetTools needs PuTTY 0.77 or newer: " & FirstLine(errText)
+    ElseIf InStr(e, "access denied") > 0 Or InStr(e, "authentication failed") > 0 Or _
+           InStr(e, "no supported authentication") > 0 Or InStr(e, "too many authentication failures") > 0 Then
+        SshClassify = "Login failed - wrong username or password"
+    ElseIf InStr(e, "connection timed out") > 0 Then
+        SshClassify = "Connection timed out"
+    ElseIf InStr(e, "connection refused") > 0 Then
+        SshClassify = "SSH refused (port 22 closed)"
+    ElseIf InStr(e, "host does not exist") > 0 Then
+        SshClassify = "Host name not found"
+    ElseIf InStr(e, "network error") > 0 Or InStr(e, "unable to open connection") > 0 Then
+        SshClassify = "Network error: " & FirstLine(errText)
+    ElseIf Len(Trim$(outText)) > 0 Then
+        SshClassify = "OK"
+        ok = True
+    Else
+        SshClassify = "No output" & IIf(Len(Trim$(errText)) > 0, " - " & FirstLine(errText), "")
+    End If
+End Function
+
+' Has PuTTY stored a host key for this device (port 22)?
+Private Function SshHostKeyKnown(ByVal host As String) As Boolean
+    Dim reg As Object, names As Variant, types As Variant, nm As Variant, suffix As String
+    On Error GoTo NotKnown
+    Set reg = GetObject("winmgmts:{impersonationLevel=impersonate}!\\.\root\default:StdRegProv")
+    If reg.EnumValues(&H80000001, "Software\SimonTatham\PuTTY\SshHostKeys", names, types) <> 0 Then Exit Function
+    If Not IsArray(names) Then Exit Function
+    suffix = "@22:" & LCase$(host)
+    For Each nm In names
+        If Right$(LCase$(CStr(nm)), Len(suffix)) = suffix Then SshHostKeyKnown = True: Exit Function
+    Next nm
+NotKnown:
+End Function
+
+Private Sub WriteSshResults(jobs() As SshJob, ByVal n As Long, ByVal cmds As String, _
+        ByVal logDir As String, ByRef nOk As Long)
+    Dim ws As Worksheet, sumWs As Worksheet, lo As ListObject, out() As Variant, i As Long, k As Long
+    Dim lines() As String, arr() As Variant, cnt As Long, sheetNames() As String
+
+    ReDim out(1 To n, 1 To 4), sheetNames(1 To n)
+    Set sumWs = NewResultSheet("SSH Summary")
+    Set lo = StartResultTable(sumWs, "SSH Logs  -  " & cmds, _
+                              Array("Device", "Status", "Lines", "Saved log"), n)
+
+    Application.ScreenUpdating = False
+    For i = 1 To n
+        out(i, 1) = jobs(i).Host
+        out(i, 2) = jobs(i).Status
+        If jobs(i).Ok Then
+            nOk = nOk + 1
+            lines = Split(Replace(jobs(i).Output, vbCr, ""), vbLf)
+            cnt = UBound(lines) + 1
+            If cnt > 1000000 Then cnt = 1000000
+            ReDim arr(1 To cnt, 1 To 1)
+            For k = 1 To cnt
+                arr(k, 1) = Left$(lines(k - 1), 32000)
+            Next k
+            Set ws = NewResultSheet("SSH " & jobs(i).Host)
+            sheetNames(i) = ws.Name
+            WriteSheetTitle ws, "SSH: " & jobs(i).Host & "  -  " & cmds
+            ws.Cells(3, 1).Value = IIf(Len(jobs(i).SavedPath) > 0, "Saved to " & jobs(i).SavedPath, "")
+            With ws.Range("A5").Resize(cnt, 1)
+                .NumberFormat = "@"          ' log lines stay text (no formulas/dates)
+                .Value = arr
+                .Font.Name = "Consolas"
+                .Font.Size = 9
+            End With
+            ws.Columns("A").ColumnWidth = 160
+            out(i, 3) = cnt
+            out(i, 4) = jobs(i).SavedPath
+        End If
+    Next i
+
+    lo.DataBodyRange.Value = out
+    For i = 1 To n
+        If jobs(i).Ok Then
+            Good lo.DataBodyRange.Cells(i, 2)
+            sumWs.Hyperlinks.Add Anchor:=lo.DataBodyRange.Cells(i, 1), Address:="", _
+                SubAddress:="'" & sheetNames(i) & "'!A1", TextToDisplay:=jobs(i).Host
+        Else
+            Bad lo.DataBodyRange.Cells(i, 2)
+        End If
+    Next i
+    FinishTable lo, n
+    Application.ScreenUpdating = True
+    sumWs.Activate
+End Sub
+
+' Username (pre-filled, remembered) and password (never saved) from the
+' NetTools login box - a small form the build adds to the add-in, with a
+' masked password field. False if cancelled.
+Private Function SshAskLogin(ByRef user As String, ByRef pw As String) As Boolean
+    Dim frm As Object
+    user = GetSetting(APP_NAME, "SSH", "User", Environ$("USERNAME"))
+    pw = ""
+    On Error GoTo NoForm
+    Set frm = VBA.UserForms.Add("NetToolsLogin")
+    On Error GoTo 0
+    If Not frm.Ask(user, pw) Then
+        Unload frm
+        Exit Function
+    End If
+    Unload frm
+    If Len(user) = 0 Or Len(pw) = 0 Then
+        MsgBox "Enter both a username and a password.", vbExclamation, APP_NAME
+        pw = ""
+        Exit Function
+    End If
+    If Not IsSafeToken(user, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_@\") Then
+        MsgBox "That username has characters NetTools can't pass to SSH safely.", vbExclamation, APP_NAME
+        pw = ""
+        Exit Function
+    End If
+    SaveSetting APP_NAME, "SSH", "User", user
+    SshAskLogin = True
+    Exit Function
+NoForm:
+    MsgBox "The NetTools login box is missing from this add-in - rebuild it with build.ps1.", vbCritical, APP_NAME
+End Function
+
+' plink.exe from the MSI, next to the add-in, or a PuTTY install.
+Private Function FindPlink() As String
+    Dim c As Variant
+    On Error Resume Next
+    For Each c In Array(Environ$("APPDATA") & "\NetTools\plink.exe", ThisWorkbook.Path & "\plink.exe", _
+                        Environ$("ProgramFiles") & "\PuTTY\plink.exe", Environ$("ProgramFiles(x86)") & "\PuTTY\plink.exe", _
+                        Environ$("LOCALAPPDATA") & "\Programs\PuTTY\plink.exe")
+        If Len(Dir$(CStr(c))) > 0 Then FindPlink = CStr(c): Exit Function
+    Next c
+End Function
+
+Private Function IsSafeToken(ByVal s As String, ByVal allowed As String) As Boolean
+    Dim i As Long
+    If Len(s) = 0 Then Exit Function
+    For i = 1 To Len(s)
+        If InStr(1, allowed, Mid$(s, i, 1), vbBinaryCompare) = 0 Then Exit Function
+    Next i
+    IsSafeToken = True
+End Function
+
+Private Function Q(ByVal s As String) As String
+    Q = """" & s & """"
+End Function
+
+Private Function FirstLine(ByVal s As String) As String
+    Dim p As Long
+    s = Trim$(Replace(s, vbCr, ""))
+    p = InStr(s, vbLf)
+    If p > 0 Then FirstLine = Left$(s, p - 1) Else FirstLine = s
+End Function
+
+Private Sub MakeFolder(ByVal path As String)
+    On Error Resume Next
+    If Len(Dir$(path, vbDirectory)) = 0 Then MkDir path
+End Sub
+
+Private Function ReadTextFile(ByVal path As String) As String
+    Dim st As Object
+    On Error Resume Next
+    If Len(Dir$(path)) = 0 Then Exit Function
+    Set st = CreateObject("ADODB.Stream")
+    st.Type = 2
+    st.Charset = "utf-8"
+    st.Open
+    st.LoadFromFile path
+    ReadTextFile = st.ReadText
+    st.Close
 End Function
 
 '==============================================================================

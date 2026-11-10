@@ -44,6 +44,8 @@ $xlamFile = Join-Path $distDir 'NetTools.xlam'
 $wxsFile  = Join-Path $root 'installer\NetTools.wxs'
 $msiFile  = Join-Path $distDir "NetTools-$Version.msi"
 $ouiFile  = Join-Path $distDir 'oui.txt'
+$plinkFile = Join-Path $distDir 'plink.exe'
+$loginFile = Join-Path $srcDir 'NetToolsLogin.vba'
 $wixVersion = '5.0.2'
 
 New-Item -ItemType Directory -Force -Path $distDir | Out-Null
@@ -83,6 +85,13 @@ try {
               "Trust Center Settings > Macro Settings, tick 'Trust access to the VBA project object model', " +
               "then run this script again. ($($_.Exception.Message))"
     }
+    # SSH login box: an empty UserForm (3 = vbext_ct_MSForm) with code that
+    # builds its controls at run time - so no binary .frx has to be kept in git
+    $form = $wb.VBProject.VBComponents.Add(3)
+    $form.Name = 'NetToolsLogin'
+    $code = $form.CodeModule
+    if ($code.CountOfLines -gt 0) { $code.DeleteLines(1, $code.CountOfLines) }
+    $code.AddFromString(([IO.File]::ReadAllText($loginFile) -replace "`r?`n", "`r`n"))
     $wb.SaveAs($xlamFile, 55)   # 55 = xlOpenXMLAddIn
     $wb.Close($false)
 } finally {
@@ -196,6 +205,28 @@ function Get-OuiLines {
     return @()
 }
 
+# PuTTY's plink.exe for SSH Logs - official build, Authenticode-checked
+Write-Host "Downloading plink.exe (PuTTY) ..."
+$hasPlink = 0
+try {
+    $tmp = "$plinkFile.download"
+    Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -OutFile $tmp `
+        -Headers @{ 'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) NetTools-build' } `
+        -Uri 'https://the.earth.li/~sgtatham/putty/latest/w64/plink.exe'
+    $sig = Get-AuthenticodeSignature $tmp
+    if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Simon Tatham') {
+        Remove-Item $tmp -Force
+        throw "signature check failed ($($sig.Status), $($sig.SignerCertificate.Subject))"
+    }
+    Move-Item -Force $tmp $plinkFile
+    Write-Host "  $((Get-Item $plinkFile).VersionInfo.ProductVersion)"
+} catch {
+    Write-Warning "plink.exe download failed: $($_.Exception.Message)"
+}
+if (Test-Path $plinkFile) { $hasPlink = 1 } else {
+    Write-Warning "The MSI won't include plink.exe - SSH Logs will need PuTTY 0.77+ installed."
+}
+
 Write-Host "Downloading MAC vendor list ..."
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 $ouiLines = @(Get-OuiLines)
@@ -211,7 +242,7 @@ if ($ouiLines.Count -gt 0) {
 
 Write-Host "Building MSI ..."
 if (Test-Path $msiFile) { Remove-Item $msiFile -Force }
-wix build $wxsFile -arch x86 -d "Version=$Version" -d "XlamPath=$xlamFile" -d "OuiPath=$ouiFile" -o $msiFile
+wix build $wxsFile -arch x86 -d "Version=$Version" -d "XlamPath=$xlamFile" -d "OuiPath=$ouiFile" -d "PlinkPath=$plinkFile" -d "HasPlink=$hasPlink" -o $msiFile
 if ($LASTEXITCODE -ne 0) { throw "wix build failed." }
 Remove-Item (Join-Path $distDir '*.wixpdb') -ErrorAction SilentlyContinue
 Write-Host "Built $msiFile" -ForegroundColor Green

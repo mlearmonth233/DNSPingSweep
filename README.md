@@ -1,7 +1,7 @@
 # DNSPingSweep: NetTools for Excel
 
 DNS resolution, ping, port check, traceroute, subnet scan, subnet calculator
-and MAC address tool. An Excel add-in that adds
+MAC address and SSH log collection tool. An Excel add-in that adds
 a **NetTools** tab to the ribbon:
 
 | Button | What it does |
@@ -14,12 +14,13 @@ a **NetTools** tab to the ribbon:
 | **Subnet Scan** | Every address in a subnet: ping, MAC address + vendor, reverse DNS, and optionally TCP ports. Hundreds at once |
 | **Subnet Calc** | Network, mask, wildcard, first/last usable, broadcast and host count for each subnet |
 | **MAC Format** | Reformats MAC addresses as `xxxx.xxxx.xxxx` or `XX:XX:XX:XX:XX:XX` (you choose) and shows the vendor |
+| **SSH Logs** | SSH into Cisco IOS / IOS-XE / 9800 or AireOS devices with your username and password, run commands such as `show logging`, one sheet per device |
 | **About** | Short help |
 
 **Results always go on a new sheet as a formatted Excel table with headers.
 The cells you select are never changed or overwritten.** Each run adds its
 own sheet (`DNS Check`, `DNS Lookup`, `Ping`, `Subnets`, `Trace server1`,
-`Scan 10.1.4.0_24`, `Port Check`, `MAC Addresses`)
+`Scan 10.1.4.0_24`, `Port Check`, `MAC Addresses`, `SSH Summary`, `SSH <device>`)
 with a title, the time it ran, and a table you can sort and filter.
 Running the same button again **overwrites** its sheet with the new
 results. NetTools only overwrites sheets it created: if one of your own
@@ -132,6 +133,40 @@ The `MAC Addresses` sheet lists each original, the formatted MAC and the
 vendor. Your choice is remembered and also used for the MAC column in
 Subnet Scan.
 
+### SSH Logs
+
+1. Select a column of device hostnames or IPs (or an empty cell to type them).
+2. Click **SSH Logs** and choose the device type:
+   - `1`: Cisco IOS / IOS-XE (switches, routers, Catalyst 9800 WLC)
+   - `2`: Cisco AireOS WLC
+3. Enter your username and password in the NetTools login box. The password
+   is masked, used only for this run, and **never saved**.
+4. Enter the commands, separated by semicolons, e.g. `show logging; show version`.
+   NetTools remembers the list for each device type. `terminal length 0`
+   (IOS) or `config paging disable` (AireOS) is sent first automatically.
+
+NetTools connects to 8 devices at a time and then adds:
+- an **SSH Summary** sheet listing each device with its status (`OK`, `Login
+  failed - wrong username or password`, `Connection timed out`, `SSH refused
+  (port 22 closed)`, `HOST KEY CHANGED`, ...), the number of lines, and a link
+  to the device's sheet;
+- one **SSH <device>** sheet per device with the full output, one line per row;
+- a copy of every log in `Documents\NetTools\SSH Logs\<device> <date time>.txt`.
+
+How it works and what to know:
+- It uses PuTTY's `plink.exe`, which the MSI installs to `%APPDATA%\NetTools`.
+  The build downloads the official copy and checks its digital signature.
+  If PuTTY 0.77 or newer is already installed, NetTools can use that instead.
+- The password reaches plink through a temporary file (`-pwfile`), not the
+  command line, and the file is deleted as soon as the run ends. For
+  AireOS the commands file also holds the login (AireOS asks for it again
+  inside the session), and it's deleted the same way.
+- **Host keys:** the first time you connect to a device, its SSH key is stored
+  (in PuTTY's normal place). If a known device later shows a *different*
+  key, NetTools refuses to connect and reports `HOST KEY CHANGED`. Check the
+  device before removing the old key in PuTTY.
+- Each device gets up to 2 minutes (`SSH_TIMEOUT_S`); Esc stops the run.
+
 ### MAC vendor list
 
 Vendors come from the IEEE OUI registry. The build downloads it once
@@ -186,7 +221,7 @@ Also available in formulas, if you want results next to your own data:
 
 ### MSI (recommended)
 
-Double-click `NetTools-3.1.0.msi` and close Excel first if it's open. No admin
+Double-click `NetTools-3.2.0.msi` and close Excel first if it's open. No admin
 rights are needed. The installer puts `NetTools.xlam` in your Excel startup
 folder (`%APPDATA%\Microsoft\Excel\XLSTART`). Excel loads it every time it
 starts, and because that folder is one of Office's default trusted
@@ -194,7 +229,7 @@ locations, the macros run without a security prompt.
 
 - Uninstall: **Settings > Apps > NetTools for Excel**.
 - Upgrade: run a newer MSI. It replaces the old version.
-- Silent / Intune / SCCM: `msiexec /i NetTools-3.1.0.msi /qn`. This is a
+- Silent / Intune / SCCM: `msiexec /i NetTools-3.2.0.msi /qn`. This is a
   **per-user** MSI, so deploy it in the *user* context.
 
 If your company uses Group Policy to turn off trusted locations or block
@@ -228,6 +263,8 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -Msi     # + dist\NetTools-
 - `-Msi` downloads the MAC vendor list from the IEEE (falling back to
   Wireshark's copy). If the PC is offline, the MSI still builds, but
   without vendor names.
+- `-Msi` also downloads PuTTY's `plink.exe` (for SSH Logs) and checks it is
+  signed by Simon Tatham, PuTTY's author.
 - `-Msi` uses the [WiX Toolset](https://wixtoolset.org/) v5. If WiX isn't
   installed, the script installs it as a .NET global tool, which needs the
   [.NET SDK](https://dotnet.microsoft.com/download) 6 or later.
@@ -239,6 +276,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -Msi     # + dist\NetTools-
 | File | Purpose |
 |---|---|
 | `src/NetTools.bas` | All the VBA: ribbon callbacks, DNS (ws2_32), ping (WMI), traceroute + subnet scan (ICMP API, ARP table, DnsQuery), port check (Winsock), MAC formatting + vendor lookup, subnet maths, worksheet functions |
+| `src/NetToolsLogin.vba` | Code for the SSH login box (the build adds it as a UserForm) |
 | `src/customUI.xml` | Ribbon tab definition |
 | `installer/NetTools.wxs` | WiX source for the per-user MSI |
 | `build.ps1` | Builds the `.xlam` and, with `-Msi`, the MSI |
