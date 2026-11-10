@@ -84,6 +84,13 @@
                   onAction="NT_OnSshLogs"
                   screentip="SSH Logs"
                   supertip="SSH into the selected Cisco IOS / IOS-XE / 9800 or AireOS devices with your username and password, run commands such as show logging, and put each device's output on its own sheet (also saved under Documents\NetTools\SSH Logs). The password is never saved." />
+          <button id="btnToTable"
+                  label="To Table"
+                  size="large"
+                  imageMso="TableInsert"
+                  onAction="NT_OnToTable"
+                  screentip="To Table"
+                  supertip="Turns CLI table output on the current sheet (e.g. show ap summary, show vlan brief) into Excel tables you can sort and filter - one 'Table ...' sheet per table. For a table with no dashes under its header (show ip interface brief), click its header line first." />
         </group>
 
         <group id="grpTools" label="Help">

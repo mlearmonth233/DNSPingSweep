@@ -15,6 +15,7 @@ a **NetTools** tab to the ribbon:
 | **Subnet Calc** | Network, mask, wildcard, first/last usable, broadcast and host count for each subnet |
 | **MAC Format** | Reformats MAC addresses as `xxxx.xxxx.xxxx` or `XX:XX:XX:XX:XX:XX` (you choose) and shows the vendor |
 | **SSH Logs** | SSH into Cisco IOS / IOS-XE / 9800 or AireOS devices with your username and password, run commands such as `show logging`, one sheet per device |
+| **To Table** | Turns CLI table output (e.g. `show ap summary`, `show vlan brief`) on a sheet into Excel tables |
 | **About** | Short help |
 
 **Results always go on a new sheet as a formatted Excel table with headers.
@@ -193,6 +194,31 @@ How it works and what to know:
   device before removing the old key in PuTTY.
 - Each device gets up to 2 minutes (`SSH_TIMEOUT_S`); Esc stops the run.
 
+### To Table
+
+Turns the text tables in device output into real Excel tables. It works on
+an `SSH <device>` sheet, or any sheet where you've pasted CLI output into a
+column.
+
+1. Click anywhere in the column with the output.
+2. Click **To Table**.
+
+NetTools finds every table, meaning a header line with a line of dashes
+under it (`show ap summary`, `show vlan brief`, `show cdp neighbors`, ...).
+Each one goes on its own sheet named after the command, e.g.
+`Table show ap summary`, as a sortable, filterable table. Running it again
+overwrites that sheet. Columns are worked out from the gaps that run down
+the whole table, so a column name with spaces (`AP Name`) stays one column
+and columns with just one space between them (`Slots AP Model`) still
+split. Whole-number columns (Slots, VLAN) become numbers so they sort
+properly. The pop-up shows the row count, and the device's own count if it
+printed one (`Number of APs: 348`), so you can check nothing was missed.
+
+- **Only one table:** click inside it first. Otherwise every table in the
+  column is converted.
+- **No dashes under the header** (e.g. `show ip interface brief`): click on
+  the header line, then **To Table**.
+
 ### MAC vendor list
 
 Vendors come from the IEEE OUI registry. The build downloads it once
@@ -257,7 +283,7 @@ Also available in formulas, if you want results next to your own data:
 
 ### MSI (recommended)
 
-Double-click `NetTools-3.4.0.msi` and close Excel first if it's open. No admin
+Double-click `NetTools-3.5.0.msi` and close Excel first if it's open. No admin
 rights are needed. The installer puts `NetTools.xlam` in your Excel startup
 folder (`%APPDATA%\Microsoft\Excel\XLSTART`). Excel loads it every time it
 starts, and because that folder is one of Office's default trusted
@@ -265,7 +291,7 @@ locations, the macros run without a security prompt.
 
 - Uninstall: **Settings > Apps > NetTools for Excel**.
 - Upgrade: run a newer MSI. It replaces the old version.
-- Silent / Intune / SCCM: `msiexec /i NetTools-3.4.0.msi /qn`. This is a
+- Silent / Intune / SCCM: `msiexec /i NetTools-3.5.0.msi /qn`. This is a
   **per-user** MSI, so deploy it in the *user* context.
 
 If your company uses Group Policy to turn off trusted locations or block

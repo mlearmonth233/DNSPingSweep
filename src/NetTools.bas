@@ -14,6 +14,8 @@ Attribute VB_Name = "NetTools"
 ' SSH Logs  : SSH (username + password, via PuTTY plink.exe) to Cisco IOS /
 '             IOS-XE / 9800 or AireOS devices, run commands such as
 '             "show logging", one sheet per device.
+' To Table  : turns CLI table output on a sheet (e.g. show ap summary,
+'             show vlan brief, show ip interface brief) into Excel tables.
 '
 ' Results always go on a NEW sheet as an Excel table - the data you select
 ' is never changed.
@@ -41,7 +43,7 @@ Private Const PING_COUNT As Long = 4             ' echo requests per host (like 
 Private Const PING_TIMEOUT_MS As Long = 1000     ' per echo request
 Private Const PING_DEAD_AFTER As Long = 2        ' stop pinging a host after this many misses in a row
 Private Const APP_NAME As String = "NetTools"
-Private Const APP_VERSION As String = "3.4.0"
+Private Const APP_VERSION As String = "3.5.0"
 
 ' ---- Result column headers ---------------------------------------------------
 Private Const H_HOST As String = "Host / IP"
@@ -314,6 +316,10 @@ Public Sub NT_OnSshLogs(control As IRibbonControl)
     RunSshLogs
 End Sub
 
+Public Sub NT_OnToTable(control As IRibbonControl)
+    RunToTable
+End Sub
+
 Public Sub NT_OnTraceroute(control As IRibbonControl)
     RunTraceroute
 End Sub
@@ -332,7 +338,7 @@ Public Sub NT_OnAbout(control As IRibbonControl)
         "   (select just the first cell to run to the end of the list)," & vbCrLf & _
         "   or select an empty cell to type them in." & vbCrLf & _
         "2. Click a button: Check DNS, DNS Only, Ping Only, Port Check," & vbCrLf & _
-        "   Traceroute, Subnet Scan, Subnet Calc, MAC Format or SSH Logs." & vbCrLf & _
+        "   Traceroute, Subnet Scan, Subnet Calc, MAC Format, SSH Logs or To Table." & vbCrLf & _
         "3. Results go on their own sheet as a table (rerunning overwrites" & vbCrLf & _
         "   that sheet) - the data you selected is never changed." & vbCrLf & _
         "   Press Esc to stop a long run." & vbCrLf & vbCrLf & _
@@ -371,6 +377,10 @@ End Sub
 
 Public Sub NetTools_SshLogs()
     RunSshLogs
+End Sub
+
+Public Sub NetTools_ToTable()
+    RunToTable
 End Sub
 
 Public Sub NetTools_Traceroute()
@@ -3268,6 +3278,324 @@ Private Function ReadTextFile(ByVal path As String) As String
     st.LoadFromFile path
     ReadTextFile = st.ReadText
     st.Close
+End Function
+
+'==============================================================================
+' To Table - CLI table output (show ap summary, show vlan brief, ...) to Excel
+'==============================================================================
+' Works on the column of the active cell. A table is a header line followed by
+' a line of dashes; columns are found from the gaps that run down the whole
+' table (so "Slots AP Model" splits, but "AP Name" stays one column). With the
+' cursor on a header line that has no dashes under it (show ip int brief),
+' that table is used. Each table goes on its own "Table <command>" sheet.
+Private Sub RunToTable()
+    Dim ws As Worksheet, col As Long, n As Long, vals As Variant, lines() As String, i As Long
+    Dim selRow As Long, specs As Collection, spec As Variant, chosen As New Collection, manual As Variant
+    Dim used As Object, report As String, nRows As Long, nm As String
+
+    If TypeName(ActiveSheet) <> "Worksheet" Then Exit Sub
+    Set ws = ActiveSheet
+    col = ActiveCell.Column
+    n = ws.Cells(ws.Rows.Count, col).End(xlUp).Row
+    If n < 2 Then
+        MsgBox "Put the CLI output in a column (or use an SSH Logs sheet), click in it, then click To Table.", _
+               vbExclamation, APP_NAME
+        Exit Sub
+    End If
+    vals = ws.Range(ws.Cells(1, col), ws.Cells(n, col)).Value
+    ReDim lines(1 To n)
+    For i = 1 To n
+        If Not IsError(vals(i, 1)) Then lines(i) = Replace(CStr(vals(i, 1)), vbTab, "    ")
+    Next i
+
+    ' Which table(s)?
+    Set specs = FindCliTables(lines, n)
+    selRow = ActiveCell.Row
+    For Each spec In specs
+        If selRow >= spec(0) And selRow <= spec(3) Then chosen.Add spec: Exit For
+    Next spec
+    If chosen.Count = 0 And selRow <= n Then
+        If Not (IsNetToolsSheet(ws) And selRow <= 4) Then
+            manual = CliManualSpec(lines, selRow, n)
+            If Not IsEmpty(manual) Then chosen.Add manual
+        End If
+    End If
+    If chosen.Count = 0 Then Set chosen = specs
+    If chosen.Count = 0 Then
+        MsgBox "No tables found in this column." & vbCrLf & vbCrLf & _
+               "If the table has no line of dashes under its header, click on the header line " & _
+               "(the one with the column names) and click To Table again.", vbExclamation, APP_NAME
+        Exit Sub
+    End If
+
+    Set used = CreateObject("Scripting.Dictionary")
+    used.CompareMode = 1
+    On Error GoTo Handler
+    Application.ScreenUpdating = False
+    For Each spec In chosen
+        nRows = MakeCliTable(ws, lines, spec, used, nm)
+        report = report & vbCrLf & "   " & nm & ":  " & nRows & " row(s)" & CliCountHint(lines, CLng(spec(0)))
+    Next spec
+    Application.ScreenUpdating = True
+    MsgBox "Made " & chosen.Count & " table(s):" & report, vbInformation, APP_NAME
+    Exit Sub
+Handler:
+    Application.ScreenUpdating = True
+    MsgBox "Error " & Err.Number & ": " & Err.Description, vbCritical, APP_NAME
+End Sub
+
+' Every "header line + dashes line + rows" block. Each = Array(header, dashes, first, last).
+Private Function FindCliTables(lines() As String, ByVal n As Long) As Collection
+    Dim c As New Collection, i As Long, j As Long, last As Long, cmd As String
+    For i = 2 To n
+        If IsDashLine(lines(i)) And Len(Trim$(lines(i - 1))) > 0 And Not IsDashLine(lines(i - 1)) _
+           And Not CliPromptCmd(lines(i - 1), cmd) Then
+            last = 0
+            j = i + 1
+            Do While j <= n
+                If CliEnd(lines(j)) Then Exit Do
+                last = j
+                j = j + 1
+            Loop
+            If last > 0 Then c.Add Array(i - 1, i, i + 1, last)
+        End If
+    Next i
+    Set FindCliTables = c
+End Function
+
+' Table whose header is the line at row h (no dashes needed). Empty if none.
+Private Function CliManualSpec(lines() As String, ByVal h As Long, ByVal n As Long) As Variant
+    Dim d As Long, f As Long, j As Long, last As Long, cmd As String
+    If h >= n Then Exit Function
+    If Len(Trim$(lines(h))) = 0 Or IsDashLine(lines(h)) Or CliPromptCmd(lines(h), cmd) Then Exit Function
+    f = h + 1
+    If IsDashLine(lines(f)) Then d = f: f = f + 1
+    j = f
+    Do While j <= n
+        If CliEnd(lines(j)) Then Exit Do
+        last = j
+        j = j + 1
+    Loop
+    If last > 0 Then CliManualSpec = Array(h, d, f, last)
+End Function
+
+' Builds one table sheet. Returns the number of rows; sheetName = the sheet used.
+Private Function MakeCliTable(ByVal src As Worksheet, lines() As String, ByVal spec As Variant, _
+        ByVal used As Object, ByRef sheetName As String) As Long
+    Dim h As Long, d As Long, f As Long, l As Long, starts() As Long, nCols As Long, nRows As Long
+    Dim headers() As Variant, out() As Variant, r As Long, c As Long, k As Long, v As String, hdr As String
+    Dim numeric() As Boolean, hasValue() As Boolean, seen As Object, cmd As String, base As String, sb As String
+    Dim ws As Worksheet, lo As ListObject
+
+    h = spec(0): d = spec(1): f = spec(2): l = spec(3)
+    nRows = l - f + 1
+    starts = CliColumnStarts(lines, h, d, f, l, nCols)
+
+    ' Column headers (unique, never blank - Excel tables need that)
+    ReDim headers(0 To nCols - 1), numeric(1 To nCols), hasValue(1 To nCols)
+    Set seen = CreateObject("Scripting.Dictionary")
+    seen.CompareMode = 1
+    For c = 1 To nCols
+        hdr = CliSlice(lines(h), starts, c, nCols)
+        If Len(hdr) = 0 Then hdr = "Column " & c
+        If seen.Exists(hdr) Then
+            k = 2
+            Do While seen.Exists(hdr & " " & k)
+                k = k + 1
+            Loop
+            hdr = hdr & " " & k
+        End If
+        seen.Add hdr, True
+        headers(c - 1) = hdr
+        numeric(c) = True
+    Next c
+
+    ' Rows
+    ReDim out(1 To nRows, 1 To nCols)
+    For r = f To l
+        For c = 1 To nCols
+            v = CliSlice(lines(r), starts, c, nCols)
+            out(r - f + 1, c) = v
+            If Len(v) > 0 Then
+                hasValue(c) = True
+                If Not IsAllDigits(v) Or Len(v) > 9 Then numeric(c) = False
+            End If
+        Next c
+    Next r
+    ' Whole-number columns (Slots, VLAN, ...) become real numbers, for sorting
+    For c = 1 To nCols
+        If numeric(c) And hasValue(c) Then
+            For r = 1 To nRows
+                If Len(out(r, c)) > 0 Then out(r, c) = CLng(out(r, c))
+            Next r
+        Else
+            numeric(c) = False
+        End If
+    Next c
+
+    ' Sheet "Table <command>", unique within this run
+    cmd = CliCommandBefore(lines, h)
+    base = "Table " & IIf(Len(cmd) > 0, cmd, src.Name)
+    sb = base
+    k = 1
+    Do While used.Exists(SheetBaseName(sb))
+        k = k + 1
+        sb = base & " " & k
+    Loop
+    used.Add SheetBaseName(sb), True
+
+    Set ws = NewResultSheet(sb)
+    Set lo = StartResultTable(ws, "Table from '" & src.Name & "'" & IIf(Len(cmd) > 0, "  -  " & cmd, "") & _
+                              "  (rows " & f & "-" & l & ")", headers, nRows)
+    For c = 1 To nCols
+        If numeric(c) Then
+            lo.DataBodyRange.Columns(c).NumberFormat = "General"
+            lo.DataBodyRange.Columns(c).HorizontalAlignment = xlRight
+        End If
+    Next c
+    lo.DataBodyRange.Value = out
+    FinishTable lo, nRows
+    sheetName = ws.Name
+    MakeCliTable = nRows
+End Function
+
+' Column start positions (1-based). A dashes line made of several groups
+' ("---- ------- ----") marks the columns directly; otherwise a column starts
+' after every position that is blank in the header AND in every row, and
+' columns with no header text are merged into the one before.
+Private Function CliColumnStarts(lines() As String, ByVal h As Long, ByVal d As Long, ByVal f As Long, _
+        ByVal l As Long, ByRef nCols As Long) As Long()
+    Dim header As String, dash As String, maxLen As Long, p As Long, r As Long, i As Long, s As Long, e As Long
+    Dim sp() As Boolean, cand As New Collection, keep As New Collection, res() As Long
+
+    header = lines(h)
+    If d > 0 Then dash = Trim$(lines(d))
+    If d > 0 And InStr(dash, " ") > 0 Then
+        dash = lines(d)
+        For p = 1 To Len(dash)
+            If InStr("-=", Mid$(dash, p, 1)) > 0 And CharAt(dash, p - 1) = " " Then keep.Add p
+        Next p
+    Else
+        maxLen = Len(header)
+        For r = f To l
+            If Len(lines(r)) > maxLen Then maxLen = Len(lines(r))
+        Next r
+        ReDim sp(0 To maxLen + 1)
+        sp(0) = True
+        For p = 1 To maxLen
+            sp(p) = (CharAt(header, p) = " ")
+            If sp(p) Then
+                For r = f To l
+                    If CharAt(lines(r), p) <> " " Then
+                        sp(p) = False
+                        Exit For
+                    End If
+                Next r
+            End If
+        Next p
+        For p = 1 To maxLen
+            If Not sp(p) And sp(p - 1) Then cand.Add p
+        Next p
+        For i = 1 To cand.Count
+            s = cand(i)
+            If i < cand.Count Then e = cand(i + 1) - 1 Else e = IIf(Len(header) > s, Len(header), s)
+            If Len(Trim$(Mid$(header, s, e - s + 1))) > 0 Or keep.Count = 0 Then keep.Add s
+        Next i
+    End If
+    If keep.Count = 0 Then keep.Add 1
+
+    nCols = keep.Count
+    ReDim res(1 To nCols)
+    For i = 1 To nCols
+        res(i) = keep(i)
+    Next i
+    CliColumnStarts = res
+End Function
+
+Private Function CliSlice(ByVal line As String, starts() As Long, ByVal c As Long, ByVal nCols As Long) As String
+    If c < nCols Then
+        CliSlice = Trim$(Mid$(line, starts(c), starts(c + 1) - starts(c)))
+    Else
+        CliSlice = Trim$(Mid$(line, starts(c)))
+    End If
+End Function
+
+Private Function CharAt(ByVal s As String, ByVal p As Long) As String
+    If p < 1 Or p > Len(s) Then CharAt = " " Else CharAt = Mid$(s, p, 1)
+End Function
+
+' "-----" or "---- ------" or "=====" lines
+Private Function IsDashLine(ByVal line As String) As Boolean
+    Dim t As String, i As Long, ch As String, marks As Long
+    t = Trim$(line)
+    If Len(t) < 3 Then Exit Function
+    For i = 1 To Len(t)
+        ch = Mid$(t, i, 1)
+        If ch = "-" Or ch = "=" Then
+            marks = marks + 1
+        ElseIf ch <> " " Then
+            Exit Function
+        End If
+    Next i
+    IsDashLine = (marks * 2 >= Len(t))
+End Function
+
+' End of a table: blank line, a device prompt, or another dashes line.
+Private Function CliEnd(ByVal line As String) As Boolean
+    Dim cmd As String
+    CliEnd = (Len(Trim$(line)) = 0) Or IsDashLine(line) Or CliPromptCmd(line, cmd)
+End Function
+
+' Is this a device prompt line ("WLC1#show ap summary", "SW1>", "(Cisco Controller) >show ...")?
+' cmd = the command typed after it, if any.
+Private Function CliPromptCmd(ByVal line As String, ByRef cmd As String) As Boolean
+    Dim t As String, p As Long, q As Long, nm As String, rest As String
+    cmd = ""
+    t = Trim$(line)
+    If Len(t) = 0 Then Exit Function
+    If Left$(t, 1) = "(" Then
+        q = InStr(t, ")")
+        If q > 0 Then
+            rest = LTrim$(Mid$(t, q + 1))
+            If Left$(rest, 1) = ">" Then cmd = Trim$(Mid$(rest, 2)): CliPromptCmd = True
+        End If
+        Exit Function
+    End If
+    p = InStr(t, "#")
+    If p = 0 Then p = InStr(t, ">")
+    If p < 2 Then Exit Function
+    nm = Left$(t, p - 1)
+    If Not IsSafeToken(nm, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.") Then Exit Function
+    cmd = Trim$(Mid$(t, p + 1))
+    CliPromptCmd = True
+End Function
+
+' The command that produced the table (the nearest prompt line above it).
+Private Function CliCommandBefore(lines() As String, ByVal h As Long) As String
+    Dim k As Long, cmd As String
+    For k = h - 1 To 1 Step -1
+        If CliPromptCmd(lines(k), cmd) Then
+            If Len(cmd) > 0 Then CliCommandBefore = cmd: Exit Function
+        End If
+    Next k
+End Function
+
+' "(device says: Number of APs: 348)" if the output states a count just above the table.
+Private Function CliCountHint(lines() As String, ByVal h As Long) As String
+    Dim k As Long, t As String
+    For k = h - 1 To IIf(h - 8 < 1, 1, h - 8) Step -1
+        t = Trim$(lines(k))
+        If LCase$(Left$(t, 9)) = "number of" Then CliCountHint = "   (device says: " & t & ")": Exit Function
+    Next k
+End Function
+
+' The name NewResultSheet would use for base (before any " 2" for clashes).
+Private Function SheetBaseName(ByVal base As String) As String
+    Dim ch As Variant
+    For Each ch In Array(":", "\", "/", "?", "*", "[", "]")
+        base = Replace(base, CStr(ch), "_")
+    Next ch
+    SheetBaseName = Left$(base, 27)
 End Function
 
 '==============================================================================
