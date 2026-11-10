@@ -141,7 +141,8 @@ Subnet Scan.
    - `2`: Cisco AireOS WLC
 3. Enter your username and password in the NetTools login box. The password
    is masked, used only for this run, and **never saved**.
-4. Enter the commands, separated by semicolons, e.g. `show logging; show version`.
+4. Enter the commands, separated by commas or semicolons, e.g.
+   `show logging, show version`.
    NetTools remembers the list for each device type. `terminal length 0`
    (IOS) or `config paging disable` (AireOS) is sent first automatically.
 
@@ -231,7 +232,7 @@ Also available in formulas, if you want results next to your own data:
 
 ### MSI (recommended)
 
-Double-click `NetTools-3.3.0.msi` and close Excel first if it's open. No admin
+Double-click `NetTools-3.3.1.msi` and close Excel first if it's open. No admin
 rights are needed. The installer puts `NetTools.xlam` in your Excel startup
 folder (`%APPDATA%\Microsoft\Excel\XLSTART`). Excel loads it every time it
 starts, and because that folder is one of Office's default trusted
@@ -239,7 +240,7 @@ locations, the macros run without a security prompt.
 
 - Uninstall: **Settings > Apps > NetTools for Excel**.
 - Upgrade: run a newer MSI. It replaces the old version.
-- Silent / Intune / SCCM: `msiexec /i NetTools-3.3.0.msi /qn`. This is a
+- Silent / Intune / SCCM: `msiexec /i NetTools-3.3.1.msi /qn`. This is a
   **per-user** MSI, so deploy it in the *user* context.
 
 If your company uses Group Policy to turn off trusted locations or block

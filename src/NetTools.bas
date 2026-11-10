@@ -41,7 +41,7 @@ Private Const PING_COUNT As Long = 4             ' echo requests per host (like 
 Private Const PING_TIMEOUT_MS As Long = 1000     ' per echo request
 Private Const PING_DEAD_AFTER As Long = 2        ' stop pinging a host after this many misses in a row
 Private Const APP_NAME As String = "NetTools"
-Private Const APP_VERSION As String = "3.3.0"
+Private Const APP_VERSION As String = "3.3.1"
 
 ' ---- Result column headers ---------------------------------------------------
 Private Const H_HOST As String = "Host / IP"
@@ -2639,7 +2639,7 @@ Private Sub RunSshLogs()
     If Not SshAskLogin(user, pw) Then Exit Sub
 
     defCmds = IIf(devType = SSH_AIREOS, SSH_DEFAULT_COMMANDS_AIREOS, SSH_DEFAULT_COMMANDS_IOS)
-    cmds = InputBox("Commands to run on each device, separated by semicolons." & vbCrLf & vbCrLf & _
+    cmds = InputBox("Commands to run on each device, separated by commas or semicolons." & vbCrLf & vbCrLf & _
                     "Example:  " & IIf(devType = SSH_AIREOS, "show msglog; show traplog", "show logging; show version") & _
                     vbCrLf & vbCrLf & "(" & IIf(devType = SSH_AIREOS, "'config paging disable'", "'terminal length 0'") & _
                     " is sent first automatically.)", APP_NAME & " - SSH commands", _
@@ -2683,7 +2683,7 @@ Private Sub RunSshLogs()
     Else
         Print #f, "terminal length 0"
     End If
-    For Each part In Split(cmds, ";")
+    For Each part In Split(Replace(cmds, ",", ";"), ";")    ' commas or semicolons between commands
         If Len(Trim$(CStr(part))) > 0 Then Print #f, Trim$(CStr(part))
     Next part
     If devType = SSH_AIREOS Then
